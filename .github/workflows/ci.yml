@@ -17,14 +17,14 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
-      # Deliberately not pinned to an exact version. Pinning to 26.0 selected an
+      # Major line only. An exact pin desyncs from the image: "26.0" selected an
       # Xcode whose SDK was iphonesimulator26.0 while the image carried only iOS
-      # 26.2+ simulator runtimes, so no iOS destination could resolve. The Swift
-      # floor is already enforced by `// swift-tools-version: 6.2` in
-      # Package.swift, which fails the build outright on an older toolchain.
+      # 26.2+ simulator runtimes, so no iOS destination could resolve. Bounding
+      # the major version keeps a future Xcode 27 image from moving the toolchain
+      # silently, while still tracking whichever 26.x matches the runtimes.
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: "26"
       - name: Report toolchain
         run: swift --version && xcodebuild -version
       - name: Format check
