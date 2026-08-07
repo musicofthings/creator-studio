@@ -1,0 +1,272 @@
+openapi: 3.1.0
+info:
+  title: Creator Studio Optional AI Gateway
+  version: 0.1.0
+  description: >-
+    Optional, self-hostable boundary for consented transcription and typed edit suggestions.
+    The local recording, editing, and export product does not depend on this API.
+servers:
+  - url: https://creator-studio.example.invalid
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      operationId: getHealth
+      responses:
+        "200":
+          description: Gateway is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /v1/transcriptions:
+    post:
+      operationId: createTranscription
+      description: >-
+        NOT YET IMPLEMENTED by services/ai-gateway; specified here as the forward
+        contract. Transcribes a bounded audio file after validating a consent receipt.
+        Production implementations should stream directly to a configured provider and
+        avoid retention.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio, consentReceipt, request]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                consentReceipt:
+                  type: string
+                  description: Signed receipt JSON or compact token.
+                request:
+                  type: string
+                  description: JSON-encoded TranscriptionRequest.
+      responses:
+        "202":
+          description: Job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+  /v1/suggestions:
+    post:
+      operationId: createSuggestions
+      description: >-
+        Implemented by services/ai-gateway. The request schema is enforced there by a
+        JSON Schema mirroring SuggestionRequest; the 202 job variant is not yet
+        implemented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SuggestionRequest"
+      responses:
+        "200":
+          description: Synchronous, schema-validated suggestions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuggestionResponse"
+        "202":
+          description: Long-running job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobAccepted"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/jobs/{jobId}:
+    description: >-
+      NOT YET IMPLEMENTED by services/ai-gateway; specified here as the forward
+      contract for long-running jobs.
+    parameters:
+      - $ref: "#/components/parameters/JobID"
+    get:
+      operationId: getJob
+      responses:
+        "200":
+          description: Current job state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteJob
+      responses:
+        "204": { description: Job canceled and retained inputs/results deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    JobID:
+      name: jobId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    BadRequest:
+      description: Invalid syntax, consent, range, or declared data class.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: Missing or invalid credentials/consent receipt.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooLarge:
+      description: Request exceeds configured size or duration limit.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: Job not found or already deleted.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, version]
+      properties:
+        status: { type: string, const: ok }
+        version: { type: string }
+    ConsentReceipt:
+      type: object
+      additionalProperties: false
+      required: [id, purpose, dataClasses, policyVersion, grantedAt]
+      properties:
+        id: { type: string, format: uuid }
+        purpose: { type: string, minLength: 1, maxLength: 120 }
+        dataClasses:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            enum: [transcript, audio, sampledFrames, fullMedia, projectMetadata]
+        policyVersion: { type: string, minLength: 1, maxLength: 40 }
+        grantedAt: { type: string, format: date-time }
+        signature: { type: string }
+    TranscriptSegment:
+      type: object
+      additionalProperties: false
+      required: [startUs, endUs, text]
+      properties:
+        startUs: { type: integer, minimum: 0 }
+        endUs: { type: integer, minimum: 1 }
+        text: { type: string, maxLength: 10000 }
+        speaker: { type: string, maxLength: 120 }
+    SuggestionRequest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, requestId, inputHash, kinds, transcript, consent]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        requestId: { type: string, format: uuid }
+        inputHash: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+        kinds:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { enum: [chapter, socialClip, focus, title, showNotes, tutorialStep] }
+        transcript:
+          type: array
+          maxItems: 50000
+          items: { $ref: "#/components/schemas/TranscriptSegment" }
+        consent: { $ref: "#/components/schemas/ConsentReceipt" }
+    Suggestion:
+      type: object
+      additionalProperties: false
+      required: [id, kind, startUs, endUs, confidence, reason, evidence, payload]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { enum: [chapter, socialClip, focus, title, showNotes, tutorialStep] }
+        startUs: { type: integer, minimum: 0 }
+        endUs: { type: integer, minimum: 1 }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        reason: { type: string, minLength: 1, maxLength: 1000 }
+        evidence:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [type, startUs, endUs]
+            properties:
+              type: { enum: [transcriptRange, sampledFrameRange, interactionRange] }
+              startUs: { type: integer, minimum: 0 }
+              endUs: { type: integer, minimum: 1 }
+        payload:
+          type: object
+          additionalProperties: true
+    SuggestionResponse:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, inputHash, provider, suggestions]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        inputHash: { type: string }
+        provider:
+          type: object
+          additionalProperties: false
+          required: [id, model, version]
+          properties:
+            id: { type: string }
+            model: { type: string }
+            version: { type: string }
+        suggestions:
+          type: array
+          items: { $ref: "#/components/schemas/Suggestion" }
+    TranscriptionRequest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, requestId, inputHash]
+      properties:
+        schemaVersion: { type: integer, const: 1 }
+        requestId: { type: string, format: uuid }
+        inputHash: { type: string }
+        locale: { type: string }
+        wordTimestamps: { type: boolean, default: true }
+        speakerLabels: { type: boolean, default: false }
+    JobAccepted:
+      type: object
+      additionalProperties: false
+      required: [jobId, status]
+      properties:
+        jobId: { type: string, format: uuid }
+        status: { type: string, const: queued }
+    Job:
+      type: object
+      additionalProperties: false
+      required: [jobId, status, progress, createdAt, updatedAt]
+      properties:
+        jobId: { type: string, format: uuid }
+        status: { enum: [queued, running, succeeded, failed, canceled] }
+        progress: { type: number, minimum: 0, maximum: 1 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        result: { type: object, additionalProperties: true }
+        error: { $ref: "#/components/schemas/Problem" }
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer, minimum: 400, maximum: 599 }
+        detail: { type: string }
+        requestId: { type: string }

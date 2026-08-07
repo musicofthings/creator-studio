@@ -1,0 +1,21 @@
+--swiftversion 6.2
+--indent 4
+--linebreaks lf
+--trimwhitespace always
+
+# Opinionated layout rules that disagree with this codebase's established style.
+# Disabled deliberately so `--lint` describes the code we actually write.
+--disable trailingCommas
+--disable wrapIfStatementBodies
+--disable wrapLoopBodies
+--disable wrapPropertyBodies
+--disable wrapMultilineStatementBraces
+--disable redundantSelf
+--disable hoistTry
+--disable hoistAwait
+--disable hoistPatternLet
+--disable unusedArguments
+--disable opaqueGenericParameters
+--disable swiftTestingTestCaseNames
+
+--exclude work,outputs,.build,DerivedData

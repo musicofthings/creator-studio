@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned so a runner-image bump cannot silently move the toolchain off the
+      # Swift version Package.swift and .swiftformat both declare.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.0"
+      - name: Format check
+        run: |
+          brew install swiftformat
+          swiftformat --lint .
+      - name: Swift tests
+        run: swift test
+      - name: Generate Xcode project
+        run: gem install xcodeproj --no-document && ruby scripts/generate_xcodeproj.rb
+      # The generator owns the entitlements, so a drifted App Group ID shows up
+      # here instead of as a nil container at runtime. The .xcodeproj itself is
+      # excluded: its object identifiers are not stable enough to diff.
+      - name: Verify generated entitlements are committed
+        run: git diff --exit-code -- '*.entitlements'
+      - name: Build iOS shell
+        run: xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudio -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+
+  gateway:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ai-gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/ai-gateway/package-lock.json
+      - run: npm ci
+      - run: npm run check

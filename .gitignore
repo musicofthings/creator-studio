@@ -1,0 +1,21 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+node_modules/
+dist/
+.env
+outputs/
+work/
+*.creatorstudio/
+*.mov
+*.mp4
+*.m4a
+*.wav
+!Tests/Fixtures/**
+
+# Local session tooling (machine paths, usage telemetry) — not project state
+.claude/session/
+session_handover.md

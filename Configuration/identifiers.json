@@ -1,0 +1,5 @@
+{
+  "appGroupID": "group.com.example.CreatorStudio",
+  "appBundleID": "com.example.CreatorStudio",
+  "broadcastExtensionBundleID": "com.example.CreatorStudio.Broadcast"
+}

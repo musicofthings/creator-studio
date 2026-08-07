@@ -1,0 +1,49 @@
+# Implementation status
+
+**Updated:** 7 August 2026  
+**Milestone:** Phase 0 capture foundation implemented; physical-device qualification pending
+
+## Implemented behavior
+
+The ReplayKit broadcast extension is a thin adapter. Queue accounting, segment rotation, storage guarding, drop policy, and finish ordering live in `CaptureWriterPipeline` in `StudioCapture`, which is generic over an opaque sample type and therefore unit tested without a device; the extension supplies only the ReplayKit timing closure, the `AVAssetWriter`-backed `SegmentWriting` implementation, and the volume-capacity probe. It writes independent H.264 screen-video, AAC app-audio, and AAC microphone-audio files as ten-second segments. No analysis, editing, AI, network, or project-database work runs in the extension.
+
+The in-flight queue is bounded per source (3 video, 24 audio) to stay well inside the broadcast extension's memory ceiling. Queue overflow and encoder backpressure drop the affected sample and increment a per-source counter that is journaled in batches and summarized at finish; only a genuine writer error, unusable sample timing, or a storage reserve breach stops capture. Losing a frame is preferable to losing the remainder of a long session, and every drop stays on the record.
+
+Every session is created under `CaptureInbox/<session UUID>/` in the configured App Group container. `events.jsonl` is append-only and flushed for lifecycle and segment-commit records. `manifest.json` is schema version 1 and atomically replaced after each journaled commit. Segment records contain role, relative path, byte length, timing in integer microseconds, and a streaming SHA-256 digest. An interrupted process can therefore recover every finalized segment even if it died after the journal flush but before the next manifest replacement. A currently open `.partial` segment is never represented as committed media.
+
+The host app discovers current, finalized, interrupted, low-storage, failed, and imported sessions. Recordings left in `recording` state become recoverable only after a stale interval, preventing the app from importing a live extension session. Import rejects unsupported schemas or roles, absolute/traversal/backslash paths, duplicate paths, symlink escapes, unexpected media extensions, non-regular files, size mismatches, oversized files, and digest mismatches. Valid media is copied—not moved—to unique project-owned source paths, hashed again after the copy, marked read-only, and recorded with capture-session provenance and source start time. The inbox is acknowledged only after the project manifest is durably saved; repeated imports are idempotent by session ID and digest.
+
+The iOS preflight checks the requested capability set, App Group availability, microphone denial, thermal state, and available storage. The UI exposes ready, recording, stopping, importing, recovered, failed, and storage-constrained states. It states that recording requires an explicit action in the system picker, the system indicator remains visible, media stays on-device, and Creator Studio performs no cloud upload.
+
+## Automated verification
+
+- Swift package suite covers the capture state machine, low-storage and capability seams, atomic manifest/journal replay, injected interruption, traversal, symlink, hash mismatch, partial-import reporting, immutable copy behavior, reader/writer schema compatibility, identifier drift between Swift and the project generator, and the existing domain/media/AI/project tests.
+- `CaptureWriterPipeline` is covered directly with an injected fake writer: queue-full and backpressure drops, batched drop journaling, rotation at the segment boundary, writer failure as terminal with committed segments preserved, storage-reserve stop, unusable sample timing, observed-source recording, and finish ordering (waiters released only after every segment commits, repeat finishes are inert, post-finish samples ignored).
+- The Xcode project generator links only `StudioDomain` and `StudioCapture` into the broadcast extension; the extension does not gain project-store, media-analysis, AI, or export dependencies.
+- The app and embedded broadcast extension build for the generic iOS Simulator with code signing disabled.
+- The optional AI gateway tests and TypeScript typecheck remain part of `make check`; capture introduces no gateway or cloud dependency.
+
+## Signed physical-device verification required
+
+ReplayKit broadcast buffers and App Group sharing cannot be qualified by an unsigned generic Simulator build. Before calling the Phase 0 exit gate complete:
+
+1. Replace `com.example.CreatorStudio`, `com.example.CreatorStudio.Broadcast`, and `group.com.example.CreatorStudio` in `Configuration/identifiers.json` and `CaptureInboxLocation`, then run `make xcodeproj` to regenerate both entitlements. `swift test` fails if the two sources disagree.
+2. Select an Apple development team, create matching App IDs/App Group capability, regenerate the Xcode project, and install the app plus extension on an iPhone and iPad.
+3. From Capture Preflight, deliberately start the Creator Studio system broadcast with microphone off and on. Exercise apps that provide and omit app audio. Confirm separate playable screen/app-audio/microphone segments, orientation metadata, duration, and sync.
+4. Stop normally and verify the session moves through stopping to ready-to-import, then imports immutable sources without changing the inbox originals.
+5. Force extension termination during the first segment, after several committed segments, during rotation, and during stop finalization. Relaunch the app and verify only finalized segments appear as recovered; no committed segment is lost.
+6. Inject low-storage conditions above and below the 1 GB reserve. Confirm capture stops with the storage-constrained state and previously committed segments import successfully.
+7. Run 5- and 30-minute captures across the supported device/OS matrix. Record extension peak memory, encoder backpressure, dropped/failed samples, thermal state, segment continuity, A/V offset/drift, and protected-content behavior.
+8. Complete 50 forced-interruption runs with no loss of committed segments before checking the Phase 0 recovery exit gate.
+
+## Known risks and boundaries
+
+- The ten-second segmentation interval bounds interruption exposure to the currently open segment, but the interval and encoder bit rates still need device-specific memory, thermal, and quality tuning.
+- Writer backpressure is lossy and recorded rather than fail-fast: samples are dropped and journaled instead of ending the session. Device measurement must confirm that the per-source queue bounds hold extension peak memory inside the platform limit and that the observed drop rate is acceptable on older devices.
+- Screen, app audio, and microphone remain independent immutable sources. Timeline track creation, proxy/waveform generation, and sync-adjustment UI are the next ingest milestone.
+- ReplayKit may omit protected content or app audio by platform policy. The UI and manifest capability model must continue to describe observed availability rather than promise it.
+- Placeholder identifiers and unsigned builds are intentionally not treated as proof that App Group handoff works on a physical device.
+
+## Next milestone
+
+The highest-value next milestone is E3 ingest: inspect AVAsset metadata, preserve orientation/time mapping, create initial screen/app-audio/microphone tracks, and generate cancellable proxy and waveform caches. That turns the now-safe capture/import handoff into an immediately editable project while retaining the immutable-source boundary.
