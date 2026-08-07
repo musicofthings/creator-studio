@@ -35,6 +35,18 @@ jobs:
       # excluded: its object identifiers are not stable enough to diff.
       - name: Verify generated entitlements are committed
         run: git diff --exit-code -- '*.entitlements'
+      # macos-26 images vary: some arrive without an iOS simulator runtime, and
+      # the generic iOS Simulator destination then resolves to nothing. A no-op
+      # on a healthy image; a multi-gigabyte download on a bare one.
+      - name: Ensure an iOS simulator runtime is installed
+        run: |
+          if xcrun simctl list runtimes | grep -q "iOS "; then
+            echo "iOS simulator runtime already present."
+          else
+            echo "No iOS simulator runtime on this image; downloading the platform."
+            xcodebuild -downloadPlatform iOS
+          fi
+          xcrun simctl list runtimes
       - name: Build iOS shell
         run: xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudio -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 
