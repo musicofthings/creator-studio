@@ -4,177 +4,179 @@ import Foundation
 import StudioDomain
 import Testing
 
-@Test func pipelineDropsSamplesInsteadOfEndingTheSessionUnderBackpressure() throws {
-    let harness = try PipelineHarness(pendingLimits: [.screen: 64])
-    defer { harness.remove() }
-    harness.writers.acceptEveryOtherSample = true
+@Suite(.serialized) struct CaptureWriterPipelineSuite {
+    @Test func pipelineDropsSamplesInsteadOfEndingTheSessionUnderBackpressure() throws {
+        let harness = try PipelineHarness(pendingLimits: [.screen: 64])
+        defer { harness.remove() }
+        harness.writers.acceptEveryOtherSample = true
 
-    for step in 0 ..< 20 {
-        harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        for step in 0 ..< 20 {
+            harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        }
+        harness.drain()
+
+        #expect(harness.pipeline.dropCounts[.screen] == 10)
+        #expect(harness.persistence.manifest.state == .recording)
+
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
+        #expect(harness.persistence.manifest.state == .finalized)
+        #expect(harness.terminalStates.isEmpty)
     }
-    harness.drain()
 
-    #expect(harness.pipeline.dropCounts[.screen] == 10)
-    #expect(harness.persistence.manifest.state == .recording)
+    @Test func pipelineDropsSamplesInsteadOfEndingTheSessionWhenTheQueueIsFull() throws {
+        let harness = try PipelineHarness(pendingLimits: [.screen: 2])
+        defer { harness.remove() }
+        harness.queue.suspend()
 
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
-    #expect(harness.persistence.manifest.state == .finalized)
-    #expect(harness.terminalStates.isEmpty)
-}
+        for step in 0 ..< 25 {
+            harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        }
+        harness.queue.resume()
+        harness.drain()
 
-@Test func pipelineDropsSamplesInsteadOfEndingTheSessionWhenTheQueueIsFull() throws {
-    let harness = try PipelineHarness(pendingLimits: [.screen: 2])
-    defer { harness.remove() }
-    harness.queue.suspend()
-
-    for step in 0 ..< 25 {
-        harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        // Two in flight, the rest dropped — the bound is what keeps a broadcast
+        // extension under its memory ceiling.
+        #expect(harness.pipeline.dropCounts[.screen] == 23)
+        #expect(harness.persistence.manifest.state == .recording)
+        #expect(harness.terminalStates.isEmpty)
     }
-    harness.queue.resume()
-    harness.drain()
 
-    // Two in flight, the rest dropped — the bound is what keeps a broadcast
-    // extension under its memory ceiling.
-    #expect(harness.pipeline.dropCounts[.screen] == 23)
-    #expect(harness.persistence.manifest.state == .recording)
-    #expect(harness.terminalStates.isEmpty)
-}
+    @Test func pipelineJournalsDropsWithoutFloodingTheJournal() throws {
+        let harness = try PipelineHarness(
+            pendingLimits: [.screen: 64],
+            storageCheckInterval: 1
+        )
+        defer { harness.remove() }
+        harness.writers.acceptEveryOtherSample = true
 
-@Test func pipelineJournalsDropsWithoutFloodingTheJournal() throws {
-    let harness = try PipelineHarness(
-        pendingLimits: [.screen: 64],
-        storageCheckInterval: 1
-    )
-    defer { harness.remove() }
-    harness.writers.acceptEveryOtherSample = true
+        for step in 0 ..< 30 {
+            harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        }
+        harness.drain()
 
-    for step in 0 ..< 30 {
-        harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.1), source: .screen)
+        // Below the batch threshold nothing is journaled yet.
+        #expect(try harness.journalEvents(ofKind: .warning).isEmpty)
+
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
+        let warnings = try harness.journalEvents(ofKind: .warning)
+        #expect(warnings.count == 1)
+        #expect(warnings.first?.detail?.contains("screen: 15") == true)
     }
-    harness.drain()
 
-    // Below the batch threshold nothing is journaled yet.
-    #expect(try harness.journalEvents(ofKind: .warning).isEmpty)
+    @Test func pipelineRotatesSegmentsAtTheDurationLimit() throws {
+        let harness = try PipelineHarness(segmentDuration: 1)
+        defer { harness.remove() }
 
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
-    let warnings = try harness.journalEvents(ofKind: .warning)
-    #expect(warnings.count == 1)
-    #expect(warnings.first?.detail?.contains("screen: 15") == true)
-}
+        for step in 0 ..< 7 {
+            harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.5), source: .screen)
+        }
+        harness.drain()
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
 
-@Test func pipelineRotatesSegmentsAtTheDurationLimit() throws {
-    let harness = try PipelineHarness(segmentDuration: 1)
-    defer { harness.remove() }
-
-    for step in 0 ..< 7 {
-        harness.pipeline.enqueue(FakeSample(seconds: Double(step) * 0.5), source: .screen)
+        // 0.0–0.5 | 1.0–1.5 | 2.0–2.5 | 3.0
+        #expect(harness.persistence.manifest.files.count == 4)
+        let recovered = try CaptureProtocolReader().loadSession(at: harness.persistence.directoryURL)
+        #expect(recovered.manifest.files.count == 4)
+        #expect(recovered.manifest.state == .finalized)
     }
-    harness.drain()
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
 
-    // 0.0–0.5 | 1.0–1.5 | 2.0–2.5 | 3.0
-    #expect(harness.persistence.manifest.files.count == 4)
-    let recovered = try CaptureProtocolReader().loadSession(at: harness.persistence.directoryURL)
-    #expect(recovered.manifest.files.count == 4)
-    #expect(recovered.manifest.state == .finalized)
-}
+    @Test func pipelineTreatsAWriterFailureAsTerminalAndKeepsCommittedSegments() throws {
+        let harness = try PipelineHarness(segmentDuration: 1)
+        defer { harness.remove() }
 
-@Test func pipelineTreatsAWriterFailureAsTerminalAndKeepsCommittedSegments() throws {
-    let harness = try PipelineHarness(segmentDuration: 1)
-    defer { harness.remove() }
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.5), source: .screen)
+        harness.drain()
 
-    harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
-    harness.pipeline.enqueue(FakeSample(seconds: 0.5), source: .screen)
-    harness.drain()
+        harness.writers.failNextAppend = true
+        harness.pipeline.enqueue(FakeSample(seconds: 1.5), source: .screen)
+        harness.drain()
+        harness.waitForTerminal()
 
-    harness.writers.failNextAppend = true
-    harness.pipeline.enqueue(FakeSample(seconds: 1.5), source: .screen)
-    harness.drain()
-    harness.waitForTerminal()
+        #expect(harness.terminalStates == [.failed])
+        #expect(harness.persistence.manifest.state == .failed)
+        // The segment that was open when the writer failed is still committed.
+        #expect(harness.persistence.manifest.files.count == 1)
+        #expect(harness.persistence.manifest.failureReason?.contains("injected") == true)
+    }
 
-    #expect(harness.terminalStates == [.failed])
-    #expect(harness.persistence.manifest.state == .failed)
-    // The segment that was open when the writer failed is still committed.
-    #expect(harness.persistence.manifest.files.count == 1)
-    #expect(harness.persistence.manifest.failureReason?.contains("injected") == true)
-}
+    @Test func pipelineStopsBeforeExhaustingTheProtectedStorageReserve() throws {
+        let harness = try PipelineHarness(
+            storageCheckInterval: 2,
+            protectedStorageReserve: 1000,
+            availableCapacity: 999
+        )
+        defer { harness.remove() }
 
-@Test func pipelineStopsBeforeExhaustingTheProtectedStorageReserve() throws {
-    let harness = try PipelineHarness(
-        storageCheckInterval: 2,
-        protectedStorageReserve: 1000,
-        availableCapacity: 999
-    )
-    defer { harness.remove() }
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .screen)
+        harness.drain()
+        harness.waitForTerminal()
 
-    harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
-    harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .screen)
-    harness.drain()
-    harness.waitForTerminal()
+        #expect(harness.terminalStates == [.storageConstrained])
+        #expect(harness.persistence.manifest.state == .storageConstrained)
+        #expect(harness.persistence.manifest.files.count == 1)
+    }
 
-    #expect(harness.terminalStates == [.storageConstrained])
-    #expect(harness.persistence.manifest.state == .storageConstrained)
-    #expect(harness.persistence.manifest.files.count == 1)
-}
+    @Test func pipelineRejectsUnusableSampleTiming() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
 
-@Test func pipelineRejectsUnusableSampleTiming() throws {
-    let harness = try PipelineHarness()
-    defer { harness.remove() }
+        harness.pipeline.enqueue(FakeSample(seconds: .nan), source: .screen)
+        harness.drain()
+        harness.waitForTerminal()
 
-    harness.pipeline.enqueue(FakeSample(seconds: .nan), source: .screen)
-    harness.drain()
-    harness.waitForTerminal()
+        #expect(harness.terminalStates == [.failed])
+        #expect(harness.persistence.manifest.state == .failed)
+    }
 
-    #expect(harness.terminalStates == [.failed])
-    #expect(harness.persistence.manifest.state == .failed)
-}
+    @Test func pipelineRecordsOnlyTheSourcesThatDelivered() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
 
-@Test func pipelineRecordsOnlyTheSourcesThatDelivered() throws {
-    let harness = try PipelineHarness()
-    defer { harness.remove() }
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .appAudio)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.2), source: .screen)
+        harness.drain()
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
 
-    harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
-    harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .appAudio)
-    harness.pipeline.enqueue(FakeSample(seconds: 0.2), source: .screen)
-    harness.drain()
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
+        #expect(harness.persistence.manifest.observedSources == [.screen, .appAudio])
+        #expect(harness.persistence.manifest.capabilities.microphone)
+    }
 
-    #expect(harness.persistence.manifest.observedSources == [.screen, .appAudio])
-    #expect(harness.persistence.manifest.capabilities.microphone)
-}
+    @Test func finishSynchronouslyWaitsForEverySegmentToCommit() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
+        harness.writers.finishDelay = 0.2
 
-@Test func finishSynchronouslyWaitsForEverySegmentToCommit() throws {
-    let harness = try PipelineHarness()
-    defer { harness.remove() }
-    harness.writers.finishDelay = 0.2
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .appAudio)
+        harness.drain()
 
-    harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
-    harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .appAudio)
-    harness.drain()
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
+        #expect(harness.persistence.manifest.files.count == 2)
+        #expect(harness.persistence.manifest.state == .finalized)
+        #expect(harness.persistence.manifest.duration == StudioTime(seconds: 0.1))
 
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
-    #expect(harness.persistence.manifest.files.count == 2)
-    #expect(harness.persistence.manifest.state == .finalized)
-    #expect(harness.persistence.manifest.duration == StudioTime(seconds: 0.1))
+        // Finishing twice must not stall or re-run the terminal path.
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
+        #expect(harness.terminalStates.isEmpty)
+    }
 
-    // Finishing twice must not stall or re-run the terminal path.
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
-    #expect(harness.terminalStates.isEmpty)
-}
+    @Test func samplesArrivingAfterFinishAreIgnored() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
 
-@Test func samplesArrivingAfterFinishAreIgnored() throws {
-    let harness = try PipelineHarness()
-    defer { harness.remove() }
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.drain()
+        #expect(harness.pipeline.finishSynchronously(timeout: 30))
 
-    harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
-    harness.drain()
-    #expect(harness.pipeline.finishSynchronously(timeout: 5))
+        harness.pipeline.enqueue(FakeSample(seconds: 1), source: .screen)
+        harness.drain()
 
-    harness.pipeline.enqueue(FakeSample(seconds: 1), source: .screen)
-    harness.drain()
-
-    #expect(harness.persistence.manifest.files.count == 1)
-    #expect(harness.persistence.manifest.state == .finalized)
+        #expect(harness.persistence.manifest.files.count == 1)
+        #expect(harness.persistence.manifest.state == .finalized)
+    }
 }
 
 // MARK: - Harness
@@ -191,6 +193,7 @@ private enum FakeWriterError: Error, CustomStringConvertible {
 
 /// Shared, lock-guarded control surface for the fake writers a test creates.
 private final class FakeWriterControl: @unchecked Sendable {
+    let completionQueue = DispatchQueue(label: "fake-writer-completion")
     private let lock = NSLock()
     private var _acceptEveryOtherSample = false
     private var _failNextAppend = false
@@ -274,7 +277,11 @@ private final class FakeSegmentWriter: CaptureSegmentWriting, @unchecked Sendabl
         let relativePath = "segments/\(source.rawValue)-\(String(format: "%04d", index)).bin"
         let url = directoryURL.appendingPathComponent(relativePath)
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+        // Complete inline unless a test is specifically exercising a slow
+        // finish. Hopping to a shared queue would make these tests depend on the
+        // global pool having a spare thread, which it may not while other tests
+        // are blocked in `finishSynchronously`.
+        let deliver = { @Sendable in
             do {
                 guard count > 0 else {
                     throw FakeWriterError.injectedAppendFailure
@@ -292,6 +299,11 @@ private final class FakeSegmentWriter: CaptureSegmentWriting, @unchecked Sendabl
             } catch {
                 completion(.failure(error))
             }
+        }
+        if delay > 0 {
+            control.completionQueue.asyncAfter(deadline: .now() + delay, execute: deliver)
+        } else {
+            deliver()
         }
     }
 }
@@ -364,7 +376,7 @@ private final class PipelineHarness: @unchecked Sendable {
     }
 
     func waitForTerminal() {
-        _ = terminalSignal.wait(timeout: .now() + 5)
+        _ = terminalSignal.wait(timeout: .now() + 30)
     }
 
     func journalEvents(ofKind kind: CaptureJournalEventKind) throws -> [CaptureJournalEvent] {
