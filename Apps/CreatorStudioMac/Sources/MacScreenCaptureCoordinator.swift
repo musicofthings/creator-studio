@@ -14,6 +14,7 @@ enum MacCaptureEvent: Sendable {
     case selecting
     case starting
     case recording(UUID)
+    case sourceObserved(CaptureSource)
     case stopped(UUID)
     case interrupted(String)
     case canceled
@@ -181,7 +182,11 @@ final class MacScreenCaptureCoordinator: NSObject {
                 delegate: streamDelegate
             )
 
-            sampleForwarder.install(createdPipeline)
+            sampleForwarder.install(createdPipeline) { [weak self] source in
+                Task { @MainActor in
+                    self?.onEvent(.sourceObserved(source))
+                }
+            }
             try createdStream.addStreamOutput(
                 sampleForwarder,
                 type: .screen,
@@ -304,13 +309,26 @@ final class MacCaptureSample: @unchecked Sendable {
 private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchecked Sendable {
     private let lock = NSLock()
     private var pipeline: CaptureWriterPipeline<MacCaptureSample>?
+    private var sourceObserver: (@Sendable (CaptureSource) -> Void)?
+    private var observedSources: Set<CaptureSource> = []
 
-    func install(_ pipeline: CaptureWriterPipeline<MacCaptureSample>) {
-        lock.withLock { self.pipeline = pipeline }
+    func install(
+        _ pipeline: CaptureWriterPipeline<MacCaptureSample>,
+        sourceObserver: @escaping @Sendable (CaptureSource) -> Void
+    ) {
+        lock.withLock {
+            self.pipeline = pipeline
+            self.sourceObserver = sourceObserver
+            observedSources = []
+        }
     }
 
     func clear() {
-        lock.withLock { pipeline = nil }
+        lock.withLock {
+            pipeline = nil
+            sourceObserver = nil
+            observedSources = []
+        }
     }
 
     func stream(
@@ -318,9 +336,7 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        guard CMSampleBufferDataIsReady(sampleBuffer),
-              let pipeline = lock.withLock({ pipeline })
-        else { return }
+        guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
 
         let source: CaptureSource
         switch type {
@@ -334,6 +350,15 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
         @unknown default:
             return
         }
+        let delivery = lock.withLock { () -> (
+            CaptureWriterPipeline<MacCaptureSample>?,
+            (@Sendable (CaptureSource) -> Void)?
+        ) in
+            let observer = observedSources.insert(source).inserted ? sourceObserver : nil
+            return (pipeline, observer)
+        }
+        guard let pipeline = delivery.0 else { return }
+        delivery.1?(source)
         pipeline.enqueue(MacCaptureSample(sampleBuffer), source: source)
     }
 

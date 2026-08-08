@@ -83,6 +83,7 @@ public struct CaptureImportResult: Hashable, Sendable {
 public enum CaptureImportError: Error, Equatable, Sendable {
     case sessionMissing(UUID)
     case sessionStillRecording(UUID)
+    case sessionStillActive(UUID)
     case noRecoverableMedia(UUID)
     case invalidSchema(String)
     case unsafePath(String)
@@ -98,6 +99,8 @@ extension CaptureImportError: LocalizedError {
             "The capture session is no longer available."
         case .sessionStillRecording:
             "The recording is still active and cannot be imported yet."
+        case .sessionStillActive:
+            "The recording is still active and cannot be deleted yet."
         case .noRecoverableMedia:
             "The session contains no committed media to recover."
         case .invalidSchema:
@@ -347,6 +350,38 @@ public actor CaptureInboxImporter {
             wasRecovered: inboxItem.status != .completed,
             inboxAcknowledged: acknowledged
         )
+    }
+
+    /// Deletes one finalized, recovered, or failed staging session. Imported
+    /// media lives in a project package by this point; this removes only the
+    /// recovery-inbox copy. An active capture cannot be deleted through this
+    /// path because its writer may still be committing a segment.
+    public func discardSession(id: UUID, now: Date = .studioNow()) throws {
+        let directory = inboxRootURL.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
+        guard fileManager.fileExists(atPath: directory.path),
+              let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory == true,
+              values.isSymbolicLink != true
+        else {
+            throw CaptureImportError.sessionMissing(id)
+        }
+
+        if let recovered = try? protocolReader.loadSession(at: directory) {
+            guard recovered.manifest.sessionID == id else {
+                throw CaptureImportError.invalidSchema("The manifest session ID does not match its directory.")
+            }
+            let inboxItem = item(for: recovered.manifest, now: now)
+            guard inboxItem.status != .recording, inboxItem.status != .stopping else {
+                throw CaptureImportError.sessionStillActive(id)
+            }
+        }
+
+        do {
+            try fileManager.removeItem(at: directory)
+            discoveryCache.removeValue(forKey: id)
+        } catch {
+            throw CaptureImportError.copyFailed("Creator Studio could not delete the recording: \(error.localizedDescription)")
+        }
     }
 
     private struct ValidatedFile {

@@ -36,8 +36,6 @@ struct CreatorStudioMacApp: App {
         Settings {
             MacSettingsView()
                 .environmentObject(model)
-                .frame(width: 460)
-                .padding()
         }
     }
 }

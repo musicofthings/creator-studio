@@ -1,7 +1,7 @@
 # Implementation status
 
 **Updated:** 8 August 2026
-**Milestone:** native macOS capture/workspace and E3 ingest slices implemented; runtime capture qualification pending
+**Milestone:** native macOS capture, workspace, editor, and first export slices implemented; runtime capture qualification pending
 
 ## macOS desktop foundation vertical slice
 
@@ -9,9 +9,9 @@ The repository now generates a native `CreatorStudioMac` target for macOS 15. It
 
 Screen recording starts only after the creator chooses a window, application, or display in the system ScreenCaptureKit picker. The adapter can include system/application audio and microphone audio, keeps those sources separate, renders the cursor and click indicator, excludes Creator Studio's own audio, and caps capture dimensions to an even, aspect-preserving 4K working size. The app is sandboxed, uses a sandbox-owned recovery inbox, and has no network dependency.
 
-ScreenCaptureKit sample buffers feed the same bounded `CaptureWriterPipeline` used by the ReplayKit foundation. Screen, application audio, and microphone are written as independent ten-second H.264/AAC segments. Every committed segment is hashed and journaled before the manifest replacement. A normal stop finalizes all open writers; an unexpected stream stop records an interrupted manifest and preserves every committed segment for the same path, hash, size, role, and immutable-copy validation used on iOS.
+ScreenCaptureKit sample buffers feed the same bounded `CaptureWriterPipeline` used by the ReplayKit foundation. Screen, application audio, and microphone are written as independent ten-second H.264/AAC segments. Every committed segment is hashed and journaled before the manifest replacement. A normal stop finalizes all open writers, then automatically creates a new timestamp-named recording project, imports immutable project-owned sources, and removes only the now-redundant recovery-inbox staging copy. Interrupted and failed sessions remain visible for explicit recovery or deletion.
 
-Still pending on macOS: signed/runtime Screen Recording and microphone qualification; A/V sync, long-capture, protected-content, thermal, storage, and multi-display measurement; editable pointer paths and input-monitoring metadata; camera capture; menu bar controls; external-drive handoff; and the full precision timeline editor. An unsigned SDK build proves compilation and package integration but does not prove TCC permission behavior or real ScreenCaptureKit media delivery.
+Still pending on macOS: signed/runtime Screen Recording and microphone qualification; A/V sync, long-capture, protected-content, thermal, storage, and multi-display measurement; editable pointer paths and input-monitoring metadata; camera capture; menu bar controls; external-drive handoff; and direct-manipulation precision editing. An unsigned SDK build proves compilation and package integration but does not prove TCC permission behavior or real ScreenCaptureKit media delivery.
 
 ## E3 media ingest vertical slice
 
@@ -35,7 +35,9 @@ All interactive timeline mutations now pass through one deterministic domain red
 
 Each project persists a bounded 50-entry command history in `timeline-history.json` beside the canonical `timeline.json`. Undo and redo survive relaunch, maintain monotonically increasing timeline revisions, and preserve source assets even when their clips are removed. Project manifest, timeline, and history updates use atomic file replacement with rollback to the previous workspace if any write fails. Older packages without a history file open with an empty compatible history.
 
-Still pending in Phase 1: Photos/share-sheet import, thumbnails/filmstrips and analysis-audio caches, direct drag gestures and a project-wide playhead, duplicate and cross-track moves, source inspector controls, camera/audio recording, render implementation, export destinations, performance signposts, and golden media tests.
+The desktop now separates the source-focused Media tab from an Editor tab. The Editor explains the master timeline, gives clips their own inspector, supports trim, split, move, hide, delete, persisted undo/redo, and can merge another saved recording at the end of every matching timeline track without modifying the original. It exports a 1080p landscape, vertical, or square QuickTime movie through the existing `RenderPlan` and export-preflight boundary. The cache control clears only rebuildable project cache products; project deletion removes that project package, while recovery deletion removes only the selected inbox session.
+
+Still pending in Phase 1: Photos/share-sheet import, thumbnails/filmstrips and analysis-audio caches, direct drag gestures and a project-wide playhead, duplicate and cross-track moves, source inspector controls, camera/audio recording, effects, captions, transitions, non-default transforms and mixes in final export, performance signposts, and golden media tests.
 
 ## Implemented behavior
 
@@ -51,7 +53,7 @@ The iOS preflight checks the requested capability set, App Group availability, m
 
 ## Automated verification
 
-- Swift package suite covers the capture state machine, low-storage and capability seams, atomic manifest/journal replay, injected interruption, traversal, symlink, hash mismatch, partial-import reporting, immutable copy behavior, reader/writer schema compatibility, identifier drift between Swift and the project generator, deterministic timeline commands, bounded history, persisted undo/redo, synchronized capture-track bootstrapping, media metadata persistence, real AVFoundation audio/video fixture inspection, proxy export, waveform reuse, and cache cancellation.
+- Swift package suite covers the capture state machine, low-storage and capability seams, atomic manifest/journal replay, injected interruption, traversal, symlink, hash mismatch, partial-import reporting, immutable copy behavior, reader/writer schema compatibility, identifier drift between Swift and the project generator, deterministic timeline commands, bounded history, persisted undo/redo, synchronized capture-track bootstrapping, media metadata persistence, real AVFoundation audio/video fixture inspection, proxy export, waveform reuse, recovery-session deletion, cache cancellation and cache clearing, and master-timeline merge persistence.
 - `CaptureWriterPipeline` is covered directly with an injected fake writer: queue-full and backpressure drops, batched drop journaling, rotation at the segment boundary, writer failure as terminal with committed segments preserved, storage-reserve stop, unusable sample timing, observed-source recording, and finish ordering (waiters released only after every segment commits, repeat finishes are inert, post-finish samples ignored).
 - The Xcode project generator links only `StudioDomain` and `StudioCapture` into the broadcast extension; the extension does not gain project-store, media-analysis, AI, or export dependencies.
 - The app and embedded broadcast extension build for the generic iOS Simulator with code signing disabled.
@@ -81,4 +83,4 @@ ReplayKit broadcast buffers and App Group sharing cannot be qualified by an unsi
 
 ## Next milestone
 
-The highest-value next milestone is the macOS precision editor slice: reuse the deterministic timeline command inspector on desktop, add a project-wide playhead and timeline-aware preview, then compile the first 1080p landscape/vertical render through the existing `RenderPlan` boundary. Proxy and waveform products can now support that work without weakening the immutable-source boundary.
+The highest-value next milestone is editor depth and real-media qualification: add a project-wide playhead, drag editing, filmstrips, and timeline-aware preview, then extend export to mixes, captions, transforms, and destinations with golden-media coverage. In parallel, perform signed ScreenCaptureKit and microphone capture qualification on physical hardware. Proxy and waveform products can support both efforts without weakening the immutable-source boundary.

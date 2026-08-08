@@ -55,6 +55,25 @@ public struct ProjectMediaImportResult: Hashable, Sendable {
     }
 }
 
+/// Result of appending another local Creator Studio project to the current
+/// project's master timeline. Source bytes are copied into the destination;
+/// the source project remains unchanged and independently editable.
+public struct ProjectRecordingMergeResult: Hashable, Sendable {
+    public var workspace: ProjectWorkspace
+    public var importedAssets: [SourceAsset]
+    public var sourceProjectID: ProjectID
+
+    public init(
+        workspace: ProjectWorkspace,
+        importedAssets: [SourceAsset],
+        sourceProjectID: ProjectID
+    ) {
+        self.workspace = workspace
+        self.importedAssets = importedAssets
+        self.sourceProjectID = sourceProjectID
+    }
+}
+
 public struct ProjectAssetIngestLocation: Hashable, Sendable {
     public var sourceURL: URL
     public var cacheDirectoryURL: URL

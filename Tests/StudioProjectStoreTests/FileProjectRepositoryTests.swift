@@ -208,4 +208,61 @@ import Testing
     )))
     #expect(location.cacheDirectoryURL.lastPathComponent == imported.importedAsset.id.description)
     #expect(location.cacheDirectoryURL.deletingLastPathComponent().lastPathComponent == "cache")
+
+    let generatedProduct = location.cacheDirectoryURL.appendingPathComponent("proxy.mov")
+    try Data("rebuildable proxy".utf8).write(to: generatedProduct)
+    let sourceURL = try await repository.assetURL(projectID: project.id, assetID: imported.importedAsset.id)
+    let sourceBefore = try Data(contentsOf: sourceURL)
+
+    try await repository.clearRebuildableCache(projectID: project.id)
+
+    let cacheRoot = location.cacheDirectoryURL.deletingLastPathComponent()
+    #expect(FileManager.default.fileExists(atPath: cacheRoot.path))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: cacheRoot.path).isEmpty)
+    #expect(try Data(contentsOf: sourceURL) == sourceBefore)
+}
+
+@Test func mergesAnotherProjectIntoTheEndOfTheMasterTimeline() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("project-merge-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+    let destinationSource = root.appendingPathComponent("destination.mov")
+    let sourceVideo = root.appendingPathComponent("source.mov")
+    let sourceAudio = root.appendingPathComponent("source.m4a")
+    try Data("destination-source".utf8).write(to: destinationSource)
+    try Data("source-video".utf8).write(to: sourceVideo)
+    try Data("source-audio".utf8).write(to: sourceAudio)
+
+    let repository = FileProjectRepository(rootURL: root.appendingPathComponent("Projects"))
+    let destination = try await repository.create(title: "Master", intent: .tutorial)
+    let source = try await repository.create(title: "Second recording", intent: .tutorial)
+    _ = try await repository.importMedia(
+        from: destinationSource,
+        descriptor: MediaImportDescriptor(kind: .screenVideo, duration: StudioTime(seconds: 5)),
+        into: destination.id
+    )
+    _ = try await repository.importMedia(
+        from: sourceVideo,
+        descriptor: MediaImportDescriptor(kind: .screenVideo, duration: StudioTime(seconds: 3)),
+        into: source.id
+    )
+    _ = try await repository.importMedia(
+        from: sourceAudio,
+        descriptor: MediaImportDescriptor(kind: .microphoneAudio, duration: StudioTime(seconds: 3)),
+        into: source.id
+    )
+
+    let merged = try await repository.mergeProject(source.id, into: destination.id)
+    let screen = try #require(merged.workspace.timeline.tracks.first(where: { $0.kind == .screen }))
+    let microphone = try #require(merged.workspace.timeline.tracks.first(where: { $0.kind == .microphone }))
+
+    #expect(merged.importedAssets.count == 2)
+    #expect(screen.clips.count == 2)
+    #expect(screen.clips[1].timelineStart == StudioTime(seconds: 5))
+    #expect(microphone.clips.count == 1)
+    #expect(microphone.clips[0].timelineStart == StudioTime(seconds: 5))
+    #expect(try Data(contentsOf: sourceVideo) == Data("source-video".utf8))
+    #expect(try await repository.loadWorkspace(id: destination.id) == merged.workspace)
 }

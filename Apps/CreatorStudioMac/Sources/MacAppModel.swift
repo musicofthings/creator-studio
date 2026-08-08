@@ -2,6 +2,7 @@ import AVFoundation
 import Foundation
 import StudioCapture
 import StudioDomain
+import StudioExport
 import StudioMediaPipeline
 import StudioProjectStore
 import SwiftUI
@@ -13,6 +14,29 @@ enum MacAssetIngestPhase: Hashable, Sendable {
     case complete
     case canceled
     case failed
+}
+
+private enum MacTimelineExportError: LocalizedError {
+    case noVideo
+    case unsupportedAdjustment
+    case compositionTrack
+    case invalidVideoDimensions
+    case exporterUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .noVideo:
+            "Add at least one video clip before exporting a movie."
+        case .unsupportedAdjustment:
+            "This first export supports trims, splits, ordering, and audio. Advanced visual adjustments need the next render slice."
+        case .compositionTrack:
+            "Creator Studio could not create an export track."
+        case .invalidVideoDimensions:
+            "A selected video has invalid dimensions for export."
+        case .exporterUnavailable:
+            "This timeline cannot be exported with the available macOS encoder."
+        }
+    }
 }
 
 struct MacAssetIngestStatus: Hashable, Sendable {
@@ -40,11 +64,12 @@ final class MacAppModel: ObservableObject {
     @Published private(set) var isWorking = false
 
     @Published var includeSystemAudio = true
-    @Published var includeMicrophone = true
+    @Published var includeMicrophone = false
     @Published private(set) var captureState: CaptureState = .ready
     @Published private(set) var captureMessage = "Choose a window, application, or display when you are ready to record."
     @Published private(set) var captureInbox: [CaptureInboxItem] = []
     @Published private(set) var preflight: CapturePreflightReport?
+    @Published private(set) var liveCaptureSources: Set<CaptureSource> = []
     @Published private(set) var ingestStatus: [AssetID: MacAssetIngestStatus] = [:]
 
     private let repository: FileProjectRepository
@@ -92,6 +117,8 @@ final class MacAppModel: ObservableObject {
     }
 
     var isRecording: Bool { captureState == .recording }
+
+    var localStoragePath: String { storageRoot.path }
 
     var captureIsBusy: Bool {
         switch captureState {
@@ -152,6 +179,25 @@ final class MacAppModel: ObservableObject {
         }
     }
 
+    func deleteProject(id: ProjectID) async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            if let workspace = try? await repository.loadWorkspace(id: id) {
+                for asset in workspace.project.assets {
+                    cancelIngest(assetID: asset.id)
+                }
+            }
+            try await repository.delete(id: id)
+            projects = try await repository.list()
+            if selectedProjectID == id {
+                selectedProjectID = projects.first?.id
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func loadWorkspace(id: ProjectID) async throws -> ProjectWorkspace {
         try await repository.loadWorkspace(id: id)
     }
@@ -171,8 +217,164 @@ final class MacAppModel: ObservableObject {
         return result
     }
 
+    func mergeRecording(
+        project sourceProjectID: ProjectID,
+        into destinationProjectID: ProjectID
+    ) async throws -> ProjectRecordingMergeResult {
+        let result = try await repository.mergeProject(sourceProjectID, into: destinationProjectID)
+        projects = try await repository.list()
+        ensureIngest(for: result.workspace, assets: result.importedAssets)
+        return result
+    }
+
+    /// First local 1080p export path. It compiles the portable render plan,
+    /// then maps its ordered clips onto an AVFoundation composition without
+    /// touching any immutable project source.
+    func export(
+        workspace: ProjectWorkspace,
+        profile: ExportProfile,
+        to outputURL: URL
+    ) async throws {
+        let plan = try TimelineCompiler().compile(
+            timeline: workspace.timeline,
+            assets: workspace.project.assets,
+            canvas: profile.canvas
+        )
+        try ExportPreflight().validate(plan: plan, profile: profile)
+        guard plan.focus.isEmpty, plan.captions.isEmpty,
+              plan.layers.allSatisfy({
+                  $0.transform == ClipTransform() && $0.gainDB == 0
+              })
+        else {
+            throw MacTimelineExportError.unsupportedAdjustment
+        }
+
+        let composition = AVMutableComposition()
+        var videoLayerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
+        let assetURLs = try await withThrowingTaskGroup(of: (AssetID, URL).self) { group in
+            for asset in workspace.project.assets {
+                group.addTask { [repository] in
+                    (asset.id, try await repository.assetURL(projectID: workspace.project.id, assetID: asset.id))
+                }
+            }
+            var result: [AssetID: URL] = [:]
+            for try await (assetID, url) in group {
+                result[assetID] = url
+            }
+            return result
+        }
+
+        for layer in plan.layers {
+            guard let sourceURL = assetURLs[layer.asset.id] else {
+                throw ProjectStoreError.invalidProject("The export plan references a missing source asset.")
+            }
+            let sourceAsset = AVURLAsset(url: sourceURL)
+            let sourceRange = CMTimeRange(
+                start: Self.cmTime(layer.sourceRange.start),
+                duration: Self.cmTime(layer.sourceRange.duration)
+            )
+            let timelineRange = CMTimeRange(
+                start: Self.cmTime(layer.timelineRange.start),
+                duration: Self.cmTime(layer.timelineRange.duration)
+            )
+
+            if let videoTrack = try await sourceAsset.loadTracks(withMediaType: .video).first {
+                guard let destinationTrack = composition.addMutableTrack(
+                    withMediaType: .video,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                ) else {
+                    throw MacTimelineExportError.compositionTrack
+                }
+                try destinationTrack.insertTimeRange(sourceRange, of: videoTrack, at: timelineRange.start)
+                if sourceRange.duration != timelineRange.duration {
+                    destinationTrack.scaleTimeRange(
+                        CMTimeRange(start: timelineRange.start, duration: sourceRange.duration),
+                        toDuration: timelineRange.duration
+                    )
+                }
+
+                let instruction = AVMutableVideoCompositionLayerInstruction(assetTrack: destinationTrack)
+                instruction.setTransform(
+                    try await Self.exportTransform(for: videoTrack, canvas: profile.canvas),
+                    at: timelineRange.start
+                )
+                instruction.setOpacity(Float(layer.transform.opacity), at: timelineRange.start)
+                if timelineRange.end < composition.duration {
+                    instruction.setOpacity(0, at: timelineRange.end)
+                }
+                videoLayerInstructions.append(instruction)
+            }
+
+            if let audioTrack = try await sourceAsset.loadTracks(withMediaType: .audio).first {
+                guard let destinationTrack = composition.addMutableTrack(
+                    withMediaType: .audio,
+                    preferredTrackID: kCMPersistentTrackID_Invalid
+                ) else {
+                    throw MacTimelineExportError.compositionTrack
+                }
+                try destinationTrack.insertTimeRange(sourceRange, of: audioTrack, at: timelineRange.start)
+                if sourceRange.duration != timelineRange.duration {
+                    destinationTrack.scaleTimeRange(
+                        CMTimeRange(start: timelineRange.start, duration: sourceRange.duration),
+                        toDuration: timelineRange.duration
+                    )
+                }
+            }
+        }
+
+        guard !videoLayerInstructions.isEmpty else { throw MacTimelineExportError.noVideo }
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = CGSize(width: profile.canvas.width, height: profile.canvas.height)
+        videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(profile.framesPerSecond))
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+        instruction.layerInstructions = videoLayerInstructions.reversed()
+        videoComposition.instructions = [instruction]
+
+        guard let exporter = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetHighestQuality
+        ) else {
+            throw MacTimelineExportError.exporterUnavailable
+        }
+        exporter.videoComposition = videoComposition
+        exporter.shouldOptimizeForNetworkUse = true
+
+        let fileManager = FileManager.default
+        let partialURL = outputURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(UUID().uuidString).creatorstudio-export.mov"
+        )
+        defer { try? fileManager.removeItem(at: partialURL) }
+        try await exporter.export(to: partialURL, as: .mov)
+        if fileManager.fileExists(atPath: outputURL.path) {
+            try fileManager.removeItem(at: outputURL)
+        }
+        try fileManager.moveItem(at: partialURL, to: outputURL)
+    }
+
     func assetURL(projectID: ProjectID, assetID: AssetID) async throws -> URL {
         try await repository.assetURL(projectID: projectID, assetID: assetID)
+    }
+
+    func applyTimelineCommand(
+        _ command: TimelineCommand,
+        to projectID: ProjectID
+    ) async throws -> ProjectWorkspace {
+        let workspace = try await repository.applyTimelineCommand(command, to: projectID)
+        projects = try await repository.list()
+        return workspace
+    }
+
+    func undoTimelineEdit(projectID: ProjectID) async throws -> ProjectWorkspace {
+        let workspace = try await repository.undoTimelineEdit(projectID: projectID)
+        projects = try await repository.list()
+        return workspace
+    }
+
+    func redoTimelineEdit(projectID: ProjectID) async throws -> ProjectWorkspace {
+        let workspace = try await repository.redoTimelineEdit(projectID: projectID)
+        projects = try await repository.list()
+        return workspace
     }
 
     func previewURL(projectID: ProjectID, assetID: AssetID) async throws -> URL {
@@ -216,6 +418,28 @@ final class MacAppModel: ObservableObject {
         }
     }
 
+    func clearRebuildableCache(for workspace: ProjectWorkspace) async throws {
+        let assetIDs = Set(workspace.project.assets.map(\.id))
+        guard !assetIDs.contains(where: { ingestStatus[$0]?.isRunning == true }) else {
+            throw ProjectStoreError.writeFailed(
+                "Wait for local ingest to finish before clearing this project's cache."
+            )
+        }
+
+        pendingIngest.removeAll { assetIDs.contains($0.asset.id) }
+        try await repository.clearRebuildableCache(projectID: workspace.project.id)
+        for assetID in assetIDs where Self.supportsIngest(
+            workspace.project.assets.first(where: { $0.id == assetID })?.kind
+        ) {
+            ingestStatus[assetID] = MacAssetIngestStatus(
+                phase: .canceled,
+                fractionCompleted: 0,
+                message: "Cache cleared; rebuild when needed",
+                result: nil
+            )
+        }
+    }
+
     func beginCapture() async {
         guard !captureIsBusy, !isRecording else { return }
         updatePreflight()
@@ -251,27 +475,51 @@ final class MacAppModel: ObservableObject {
     }
 
     func importCapture(_ item: CaptureInboxItem) async {
+        await saveCapture(item, discardingStagingCopy: false)
+    }
+
+    func discardCapture(_ item: CaptureInboxItem) async {
+        guard item.status != .recording, item.status != .stopping else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            try await captureImporter.discardSession(id: item.sessionID)
+            captureInbox = await captureImporter.discover()
+            captureState = .ready
+            captureMessage = "Deleted the unimported recording and its recovery files."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func saveCapture(
+        _ item: CaptureInboxItem,
+        discardingStagingCopy: Bool
+    ) async {
         guard item.canImport else { return }
         captureState = .importing
-        captureMessage = "Validating hashes and copying immutable recording sources into a desktop project…"
+        captureMessage = "Validating hashes and saving a new local recording…"
         isWorking = true
         defer { isWorking = false }
 
         var createdProjectID: ProjectID?
         do {
-            let title = item.status == .recovered ? "Recovered Mac Recording" : "Mac Screen Recording"
+            let title = Self.recordingTitle(for: item)
             let project = try await repository.create(title: title, intent: .tutorial)
             createdProjectID = project.id
             let result = try await captureImporter.importSession(id: item.sessionID, into: project.id)
             projects = try await repository.list()
-            captureInbox = await captureImporter.discover()
             selectedProjectID = project.id
             let workspace = try await repository.loadWorkspace(id: project.id)
             ensureIngest(for: workspace, assets: result.importedAssets)
             captureState = .finalized
+            if discardingStagingCopy {
+                try? await captureImporter.discardSession(id: item.sessionID)
+            }
+            captureInbox = await captureImporter.discover()
             captureMessage = result.wasRecovered
-                ? "Recovered recording imported as immutable local sources."
-                : "Recording imported as immutable local sources."
+                ? "Saved \(title) from recovered local media."
+                : "Saved \(title) as a new local recording."
         } catch {
             if let createdProjectID {
                 try? await repository.delete(id: createdProjectID)
@@ -313,6 +561,7 @@ final class MacAppModel: ObservableObject {
     private func handleCaptureEvent(_ event: MacCaptureEvent) {
         switch event {
         case .selecting:
+            liveCaptureSources = []
             captureState = .preparing
             captureMessage = "Choose one window, application, or display in the system picker."
         case .starting:
@@ -320,11 +569,21 @@ final class MacAppModel: ObservableObject {
             captureMessage = "Starting the local ScreenCaptureKit stream…"
         case .recording:
             captureState = .recording
-            captureMessage = "Recording locally. The system recording indicator remains visible."
-        case .stopped:
-            captureState = .finalized
-            captureMessage = "Recording stopped safely. Import it below to create an editable project."
-            Task { await refresh() }
+            captureMessage = liveCaptureSources.contains(.screen)
+                ? "Video frames are arriving and being recorded locally."
+                : "Recording locally; waiting for the first video frame…"
+        case let .sourceObserved(source):
+            liveCaptureSources.insert(source)
+            let audioSources = liveCaptureSources.intersection([.appAudio, .microphone]).count
+            if liveCaptureSources.contains(.screen) {
+                captureMessage = audioSources > 0
+                    ? "Video and audio frames are arriving and being recorded locally."
+                    : "Video frames are arriving and being recorded locally."
+            }
+        case let .stopped(sessionID):
+            captureState = .importing
+            captureMessage = "Recording stopped safely. Saving it as a new local project…"
+            Task { await automaticallySaveCompletedCapture(sessionID: sessionID) }
         case let .interrupted(message):
             captureState = .recovered
             captureMessage = message
@@ -337,6 +596,34 @@ final class MacAppModel: ObservableObject {
             captureMessage = message
             Task { await refresh() }
         }
+    }
+
+    private func automaticallySaveCompletedCapture(sessionID: UUID) async {
+        captureInbox = await captureImporter.discover()
+        guard let item = captureInbox.first(where: { $0.sessionID == sessionID }) else {
+            captureState = .failed
+            captureMessage = "The finished recording could not be found in local storage."
+            return
+        }
+        await saveCapture(item, discardingStagingCopy: true)
+    }
+
+    private static func recordingTitle(for item: CaptureInboxItem) -> String {
+        let components = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: item.startedAt
+        )
+        let prefix = item.status == .recovered ? "Recovered Recording" : "Recording"
+        return String(
+            format: "%@ %04d-%02d-%02d %02d.%02d.%02d",
+            prefix,
+            components.year ?? 0,
+            components.month ?? 0,
+            components.day ?? 0,
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
     }
 
     private func startIngest(projectID: ProjectID, asset: SourceAsset) {
@@ -417,11 +704,11 @@ final class MacAppModel: ObservableObject {
         startIngest(projectID: pending.projectID, asset: pending.asset)
     }
 
-    private static func supportsIngest(_ kind: MediaKind) -> Bool {
+    private static func supportsIngest(_ kind: MediaKind?) -> Bool {
         switch kind {
-        case .screenVideo, .cameraVideo, .appAudio, .microphoneAudio, .music:
+        case .screenVideo?, .cameraVideo?, .appAudio?, .microphoneAudio?, .music?:
             true
-        case .image, .overlay:
+        case .image?, .overlay?, nil:
             false
         }
     }
@@ -451,6 +738,35 @@ final class MacAppModel: ObservableObject {
         ) else { return 0 }
         if let important = values.volumeAvailableCapacityForImportantUsage { return important }
         return Int64(values.volumeAvailableCapacity ?? 0)
+    }
+
+    private static func cmTime(_ time: StudioTime) -> CMTime {
+        CMTime(value: time.microseconds, timescale: 1_000_000)
+    }
+
+    private static func exportTransform(
+        for track: AVAssetTrack,
+        canvas: CanvasSpec
+    ) async throws -> CGAffineTransform {
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        let orientedRect = CGRect(origin: .zero, size: naturalSize)
+            .applying(preferredTransform)
+            .standardized
+        guard orientedRect.width > 0, orientedRect.height > 0 else {
+            throw MacTimelineExportError.invalidVideoDimensions
+        }
+
+        let scale = min(
+            CGFloat(canvas.width) / orientedRect.width,
+            CGFloat(canvas.height) / orientedRect.height
+        )
+        let centeredX = (CGFloat(canvas.width) - orientedRect.width * scale) / 2
+        let centeredY = (CGFloat(canvas.height) - orientedRect.height * scale) / 2
+        return preferredTransform
+            .concatenating(CGAffineTransform(translationX: -orientedRect.minX, y: -orientedRect.minY))
+            .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+            .concatenating(CGAffineTransform(translationX: centeredX, y: centeredY))
     }
 
     private func thermalState() -> CaptureThermalState {

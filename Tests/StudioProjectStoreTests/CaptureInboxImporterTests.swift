@@ -86,6 +86,17 @@ import Testing
     #expect(result.importedAssets.count == 1)
 }
 
+@Test func discardingACompletedSessionRemovesOnlyTheRecoveryInboxCopy() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let session = try fixture.makeSession(state: .finalized)
+
+    try await fixture.importer.discardSession(id: session.id)
+
+    #expect(!FileManager.default.fileExists(atPath: session.mediaURL.path))
+    #expect(await fixture.importer.discover().isEmpty)
+}
+
 @Test func cachedActiveSessionBecomesRecoverableAfterTheStaleThreshold() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("capture-stale-cache-\(UUID().uuidString)", isDirectory: true)

@@ -125,6 +125,30 @@ public actor FileProjectRepository: ProjectRepository {
         }
     }
 
+    /// Removes only disposable products generated from immutable sources. The
+    /// cache directory is recreated immediately so later ingest can safely
+    /// rebuild proxies and waveforms without changing project semantics.
+    public func clearRebuildableCache(projectID: ProjectID) async throws {
+        _ = try await load(id: projectID)
+        let package = packageURL(for: projectID)
+        let cache = try Self.safeRelativeURL("cache", inside: package, fileManager: fileManager)
+
+        do {
+            if fileManager.fileExists(atPath: cache.path) {
+                let values = try cache.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard values.isDirectory == true, values.isSymbolicLink != true else {
+                    throw ProjectStoreError.invalidProject("The project cache path is unsafe.")
+                }
+                try fileManager.removeItem(at: cache)
+            }
+            try fileManager.createDirectory(at: cache, withIntermediateDirectories: true)
+        } catch let error as ProjectStoreError {
+            throw error
+        } catch {
+            throw ProjectStoreError.writeFailed(error.localizedDescription)
+        }
+    }
+
     public func list() async throws -> [ProjectSummary] {
         guard fileManager.fileExists(atPath: rootURL.path) else { return [] }
 
@@ -279,6 +303,143 @@ public actor FileProjectRepository: ProjectRepository {
         edited.project.updatedAt = now
         try persist(edited, replacing: original)
         return edited
+    }
+
+    /// Copies the visible clips from another local project and appends them as
+    /// one synchronized recording block at the end of this project's master
+    /// timeline. The source project and both sets of immutable source files are
+    /// left untouched.
+    public func mergeProject(
+        _ sourceProjectID: ProjectID,
+        into destinationProjectID: ProjectID,
+        now: Date = .studioNow(),
+        maximumBytes: Int64 = 100_000_000_000
+    ) async throws -> ProjectRecordingMergeResult {
+        guard sourceProjectID != destinationProjectID else {
+            throw ProjectStoreError.invalidProject("Choose a different recording to add to this master timeline.")
+        }
+
+        let source = try await loadWorkspace(id: sourceProjectID)
+        let destination = try await loadWorkspace(id: destinationProjectID)
+        let sourceClips = source.timeline.tracks
+            .sorted { $0.order < $1.order }
+            .flatMap { track in track.clips.map { (track, $0) } }
+        guard !sourceClips.isEmpty else {
+            throw ProjectStoreError.invalidProject("The selected recording has no timeline clips to add.")
+        }
+
+        let sourceAssetIDs = Set(sourceClips.map(\.1.assetID))
+        let sourceAssets = source.project.assets.filter { sourceAssetIDs.contains($0.id) }
+        guard sourceAssets.count == sourceAssetIDs.count else {
+            throw ProjectStoreError.invalidProject("The selected recording references a missing source asset.")
+        }
+
+        let destinationPackage = packageURL(for: destinationProjectID)
+        let destinationSources = destinationPackage.appendingPathComponent("sources", isDirectory: true)
+        var importedAssets: [SourceAsset] = []
+        var copiedURLs: [URL] = []
+
+        do {
+            for sourceAsset in sourceAssets {
+                let sourceURL = try await assetURL(projectID: sourceProjectID, assetID: sourceAsset.id)
+                let newAssetID = AssetID()
+                let fileExtension = sourceURL.pathExtension.lowercased()
+                let destinationURL = destinationSources.appendingPathComponent(
+                    "\(newAssetID.description).\(fileExtension)",
+                    isDirectory: false
+                )
+                let copied = try Self.copyHashingContents(
+                    from: sourceURL,
+                    to: destinationURL,
+                    maximumBytes: maximumBytes,
+                    fileManager: fileManager
+                )
+                copiedURLs.append(destinationURL)
+                if let expectedHash = sourceAsset.contentHash,
+                   expectedHash != "sha256:\(copied.digest)" {
+                    throw ProjectStoreError.invalidProject("A source recording changed before it could be merged.")
+                }
+                try fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: destinationURL.path)
+                importedAssets.append(SourceAsset(
+                    id: newAssetID,
+                    kind: sourceAsset.kind,
+                    relativePath: "sources/\(destinationURL.lastPathComponent)",
+                    originalFilename: sourceAsset.originalFilename,
+                    byteCount: copied.byteCount,
+                    contentHash: "sha256:\(copied.digest)",
+                    duration: sourceAsset.duration,
+                    pixelSize: sourceAsset.pixelSize,
+                    mediaMetadata: sourceAsset.mediaMetadata,
+                    createdAt: now,
+                    captureSessionID: sourceAsset.captureSessionID,
+                    captureStart: sourceAsset.captureStart
+                ))
+            }
+
+            let assetIDMap = Dictionary(uniqueKeysWithValues: zip(sourceAssets.map(\.id), importedAssets.map(\.id)))
+            var assetDurations = try assetDurations(in: destination.project)
+            for asset in importedAssets {
+                assetDurations[asset.id] = asset.duration
+            }
+
+            let destinationEnd = destination.timeline.tracks
+                .flatMap(\.clips)
+                .map(\.timelineRange.end)
+                .max() ?? .zero
+            let sourceOrigin = sourceClips.map(\.1.timelineStart).min() ?? .zero
+            var timeline = destination.timeline
+            var history = destination.editHistory
+
+            for (sourceTrack, sourceClip) in sourceClips {
+                guard let newAssetID = assetIDMap[sourceClip.assetID] else {
+                    throw ProjectStoreError.invalidProject("The selected recording has an invalid source map.")
+                }
+                let destinationTrack: TimelineTrack
+                if let existing = timeline.tracks.first(where: { $0.kind == sourceTrack.kind }) {
+                    destinationTrack = existing
+                } else {
+                    let nextOrder = (timeline.tracks.map(\.order).max() ?? -1) + 1
+                    destinationTrack = TimelineTrack(kind: sourceTrack.kind, order: nextOrder)
+                }
+
+                let mergedClip = TimelineClip(
+                    assetID: newAssetID,
+                    sourceRange: sourceClip.sourceRange,
+                    timelineStart: destinationEnd + (sourceClip.timelineStart - sourceOrigin),
+                    playbackRate: sourceClip.playbackRate,
+                    transform: sourceClip.transform,
+                    gainDB: sourceClip.gainDB,
+                    isEnabled: sourceClip.isEnabled
+                )
+                let command = TimelineCommand.placeClip(
+                    trackID: destinationTrack.id,
+                    trackKind: destinationTrack.kind,
+                    trackOrder: destinationTrack.order,
+                    clip: mergedClip
+                )
+                let before = timeline
+                timeline = try TimelineEditor().applying(
+                    command,
+                    to: timeline,
+                    assetDurations: assetDurations
+                )
+                try history.record(command: command, before: before, after: timeline)
+            }
+
+            var project = destination.project
+            project.assets.append(contentsOf: importedAssets)
+            project.updatedAt = now
+            let merged = ProjectWorkspace(project: project, timeline: timeline, editHistory: history)
+            try persist(merged, replacing: destination)
+            return ProjectRecordingMergeResult(
+                workspace: merged,
+                importedAssets: importedAssets,
+                sourceProjectID: sourceProjectID
+            )
+        } catch {
+            for url in copiedURLs { try? fileManager.removeItem(at: url) }
+            throw error
+        }
     }
 
     /// Copies a user-selected file into immutable project-owned storage and adds
