@@ -44,6 +44,49 @@ import Testing
     #expect(result.importedAssets.count == 1)
 }
 
+@Test func cachedActiveSessionBecomesRecoverableAfterTheStaleThreshold() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("capture-stale-cache-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let inbox = root.appendingPathComponent("CaptureInbox", isDirectory: true)
+    let repository = FileProjectRepository(rootURL: root.appendingPathComponent("Projects"))
+    let importer = CaptureInboxImporter(
+        inboxRootURL: inbox,
+        repository: repository,
+        staleRecordingInterval: 45
+    )
+    let recordedAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let persistence = try CaptureSessionPersistence(
+        inboxRootURL: inbox,
+        capabilities: CaptureCapabilities(
+            supportedSources: [.screen],
+            supportsBackgroundCapture: true,
+            supportsPause: false
+        ),
+        now: recordedAt
+    )
+    let media = Data("committed-before-crash".utf8)
+    let mediaURL = persistence.directoryURL.appendingPathComponent("segments/screen-0000.mov")
+    try media.write(to: mediaURL)
+    let digest = SHA256.hash(data: media).map { String(format: "%02x", $0) }.joined()
+    try persistence.commit(
+        CaptureSegment(
+            source: .screen,
+            relativePath: "segments/screen-0000.mov",
+            sha256: digest,
+            byteCount: Int64(media.count),
+            start: .zero,
+            duration: StudioTime(seconds: 2)
+        ),
+        at: recordedAt
+    )
+
+    let active = await importer.discover(now: recordedAt.addingTimeInterval(5))
+    #expect(active.first?.status == .recording)
+    let recovered = await importer.discover(now: recordedAt.addingTimeInterval(50))
+    #expect(recovered.first?.status == .recovered)
+}
+
 @Test func importsCommittedMediaAfterStorageOrWriterFailure() async throws {
     for state in [CaptureManifestState.storageConstrained, .failed] {
         let fixture = try CaptureImportFixture()

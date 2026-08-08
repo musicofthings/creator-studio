@@ -59,7 +59,12 @@ public struct TimelineClip: Hashable, Codable, Sendable, Identifiable {
 
     public var timelineDuration: StudioTime {
         guard playbackRate.isFinite, playbackRate > 0 else { return .zero }
-        return StudioTime(seconds: sourceRange.duration.seconds / playbackRate)
+        let seconds = sourceRange.duration.seconds / playbackRate
+        guard seconds.isFinite,
+              seconds > 0,
+              seconds <= Double(Int64.max) / 1_000_000
+        else { return .zero }
+        return StudioTime(seconds: seconds)
     }
 
     public var timelineRange: StudioTimeRange {

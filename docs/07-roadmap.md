@@ -139,7 +139,7 @@ Remote source recovery survives network loss; live latency/thermal/reconnect SLO
 
 - [x] Import capture artifact into immutable project sources.
 - [ ] Generate proxy/waveform cache products from imported sources.
-- Add viewer/timeline shell and manual focus event.
+- [x] Add viewer/timeline shell and deterministic trim/split/reorder/delete/undo commands; manual focus event remains.
 - Compile a render plan for 16:9 and 9:16 and export both.
 - [x] Add deterministic extension/host interruption recovery tests.
 - [ ] Force terminate signed device captures at defined points and complete the 50-run recovery gate.

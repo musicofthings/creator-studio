@@ -171,7 +171,17 @@ public actor CaptureInboxImporter {
                let stamp,
                cached.manifestModified == stamp.modified,
                cached.manifestSize == stamp.size {
-                return cached.item
+                var item = cached.item
+                if item.status == .recording || item.status == .stopping,
+                   item.segmentCount > 0,
+                   now.timeIntervalSince(item.updatedAt) > staleRecordingInterval {
+                    // Status is partly a function of time. A crashed extension
+                    // stops touching its manifest, so returning the cached status
+                    // unchanged would leave the session "recording" forever.
+                    item.status = .recovered
+                    discoveryCache[id]?.item = item
+                }
+                return item
             }
 
             let item: CaptureInboxItem
@@ -288,6 +298,8 @@ public actor CaptureInboxImporter {
                     id: assetID,
                     kind: Self.mediaKind(for: file.segment.source),
                     relativePath: "sources/\(destination.lastPathComponent)",
+                    originalFilename: file.url.lastPathComponent,
+                    byteCount: file.segment.byteCount,
                     contentHash: "sha256:\(copiedHash)",
                     duration: file.segment.duration,
                     createdAt: now,

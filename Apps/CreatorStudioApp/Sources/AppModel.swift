@@ -183,6 +183,49 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func loadWorkspace(id: ProjectID) async throws -> ProjectWorkspace {
+        try await repository.loadWorkspace(id: id)
+    }
+
+    func importMedia(
+        from sourceURL: URL,
+        descriptor: MediaImportDescriptor,
+        into projectID: ProjectID
+    ) async throws -> ProjectMediaImportResult {
+        let result = try await repository.importMedia(
+            from: sourceURL,
+            descriptor: descriptor,
+            into: projectID
+        )
+        projects = try await repository.list()
+        return result
+    }
+
+    func assetURL(projectID: ProjectID, assetID: AssetID) async throws -> URL {
+        try await repository.assetURL(projectID: projectID, assetID: assetID)
+    }
+
+    func applyTimelineCommand(
+        _ command: TimelineCommand,
+        to projectID: ProjectID
+    ) async throws -> ProjectWorkspace {
+        let workspace = try await repository.applyTimelineCommand(command, to: projectID)
+        projects = try await repository.list()
+        return workspace
+    }
+
+    func undoTimelineEdit(projectID: ProjectID) async throws -> ProjectWorkspace {
+        let workspace = try await repository.undoTimelineEdit(projectID: projectID)
+        projects = try await repository.list()
+        return workspace
+    }
+
+    func redoTimelineEdit(projectID: ProjectID) async throws -> ProjectWorkspace {
+        let workspace = try await repository.redoTimelineEdit(projectID: projectID)
+        projects = try await repository.list()
+        return workspace
+    }
+
     private func defaultTitle(for intent: ProjectIntent) -> String {
         let kind = switch intent {
         case .tutorial: "Tutorial"

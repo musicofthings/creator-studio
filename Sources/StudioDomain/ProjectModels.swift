@@ -33,6 +33,8 @@ public struct SourceAsset: Hashable, Codable, Sendable {
     public var id: AssetID
     public var kind: MediaKind
     public var relativePath: String
+    public var originalFilename: String?
+    public var byteCount: Int64?
     public var contentHash: String?
     public var duration: StudioTime
     public var pixelSize: PixelSize?
@@ -44,6 +46,8 @@ public struct SourceAsset: Hashable, Codable, Sendable {
         id: AssetID = AssetID(),
         kind: MediaKind,
         relativePath: String,
+        originalFilename: String? = nil,
+        byteCount: Int64? = nil,
         contentHash: String? = nil,
         duration: StudioTime,
         pixelSize: PixelSize? = nil,
@@ -54,6 +58,8 @@ public struct SourceAsset: Hashable, Codable, Sendable {
         self.id = id
         self.kind = kind
         self.relativePath = relativePath
+        self.originalFilename = originalFilename
+        self.byteCount = byteCount
         self.contentHash = contentHash
         self.duration = duration
         self.pixelSize = pixelSize
