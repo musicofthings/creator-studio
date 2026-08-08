@@ -66,6 +66,7 @@ public enum TimelineCommand: Hashable, Codable, Sendable {
     case move(clipID: ClipID, toIndex: Int)
     case delete(clipID: ClipID)
     case setEnabled(clipID: ClipID, isEnabled: Bool)
+    case addFocusEvents([FocusEvent])
 }
 
 public struct TimelineHistoryEntry: Hashable, Codable, Sendable {
@@ -419,6 +420,22 @@ public struct TimelineEditor: Sendable {
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
             timeline.tracks[location.track].clips[location.clip].isEnabled = isEnabled
+
+        case let .addFocusEvents(events):
+            guard !events.isEmpty else { throw TimelineEditError.invalidTimeline }
+            for event in events {
+                try Self.validate(focusEvent: event)
+                guard !timeline.focusEvents.contains(where: { $0.id == event.id }) else {
+                    throw TimelineEditError.invalidTimeline
+                }
+                timeline.focusEvents.append(event)
+            }
+            timeline.focusEvents.sort { lhs, rhs in
+                if lhs.timeRange.start != rhs.timeRange.start {
+                    return lhs.timeRange.start < rhs.timeRange.start
+                }
+                return lhs.id.description < rhs.id.description
+            }
         }
 
         timeline.revision = try Self.nextRevision(after: timeline.revision)
@@ -446,6 +463,9 @@ public struct TimelineEditor: Sendable {
                 try validate(clip: clip, assetDurations: assetDurations)
             }
         }
+        for event in timeline.focusEvents {
+            try validate(focusEvent: event)
+        }
     }
 
     private static func validate(
@@ -463,6 +483,19 @@ public struct TimelineEditor: Sendable {
         let sourceEnd = try safeEnd(of: clip.sourceRange)
         if let assetDuration = assetDurations[clip.assetID], sourceEnd > assetDuration {
             throw TimelineEditError.invalidSourceRange(clip.id)
+        }
+    }
+
+    private static func validate(focusEvent: FocusEvent) throws {
+        guard focusEvent.timeRange.isValid,
+              focusEvent.region.isFinite,
+              focusEvent.region.isPositive,
+              focusEvent.strength.isFinite,
+              (0 ... 1).contains(focusEvent.strength),
+              focusEvent.confidence.isFinite,
+              (0 ... 1).contains(focusEvent.confidence)
+        else {
+            throw TimelineEditError.invalidTimeline
         }
     }
 

@@ -14,7 +14,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+               BlueprintIdentifier = "F01D18FD0B57A79ED85B1F40"
                BuildableName = "CreatorStudioMac.app"
                BlueprintName = "CreatorStudioMac"
                ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -30,7 +30,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BlueprintIdentifier = "F01D18FD0B57A79ED85B1F40"
             BuildableName = "CreatorStudioMac.app"
             BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -53,7 +53,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BlueprintIdentifier = "F01D18FD0B57A79ED85B1F40"
             BuildableName = "CreatorStudioMac.app"
             BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -70,7 +70,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BlueprintIdentifier = "F01D18FD0B57A79ED85B1F40"
             BuildableName = "CreatorStudioMac.app"
             BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">

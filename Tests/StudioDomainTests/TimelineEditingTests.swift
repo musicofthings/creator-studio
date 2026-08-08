@@ -85,6 +85,32 @@ import Testing
     )
 }
 
+@Test func focusEventsArePersistentUndoableTimelineEdits() throws {
+    let timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    let focus = FocusEvent(
+        timeRange: StudioTimeRange(
+            start: StudioTime(seconds: 2),
+            duration: StudioTime(seconds: 1.5)
+        ),
+        region: NormalizedRect(x: 0.3, y: 0.4, width: 0.4, height: 0.4),
+        strength: 0.8,
+        source: .interactionEvent,
+        confidence: 0.9
+    )
+
+    let edited = try TimelineEditor().performing(
+        .addFocusEvents([focus]),
+        on: timeline,
+        history: TimelineEditHistory(timeline: timeline),
+        assetDurations: [:]
+    )
+    #expect(edited.timeline.focusEvents == [focus])
+    #expect(edited.history.canUndo)
+
+    let undone = try TimelineEditor().undoing(edited.timeline, history: edited.history)
+    #expect(undone.timeline.focusEvents.isEmpty)
+}
+
 @Test func extremePlaybackRateCannotTrapTimelineDuration() {
     let clip = TimelineClip(
         assetID: AssetID(),

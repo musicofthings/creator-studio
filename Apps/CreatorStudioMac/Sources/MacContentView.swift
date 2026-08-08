@@ -12,14 +12,20 @@ import UniformTypeIdentifiers
 struct MacContentView: View {
     @EnvironmentObject private var model: MacAppModel
     @State private var projectPendingDeletion: ProjectSummary?
+    @State private var expandedProjectIDs: Set<ProjectID> = []
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $model.selectedProjectID) {
+            List {
                 Section {
-                    MacCaptureCard()
-                        .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
-                        .listRowBackground(Color.clear)
+                    MacWorkspaceSummary(
+                        projectCount: model.projects.count,
+                        recordingCount: model.projects.reduce(0) { $0 + $1.recordings.count }
+                    )
+                    .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 4, trailing: 8))
+                    .listRowBackground(Color.clear)
+                } header: {
+                    Label("Workspace", systemImage: "square.3.layers.3d")
                 }
 
                 Section("Projects") {
@@ -29,12 +35,39 @@ struct MacContentView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(model.projects) { project in
-                            MacProjectRow(project: project) {
-                                projectPendingDeletion = project
-                            }
-                            .tag(project.id)
+                            MacProjectNavigationGroup(
+                                project: project,
+                                isSelected: model.selectedProjectID == project.id,
+                                isExpanded: Binding(
+                                    get: { expandedProjectIDs.contains(project.id) },
+                                    set: { isExpanded in
+                                        if isExpanded {
+                                            expandedProjectIDs.insert(project.id)
+                                        } else {
+                                            expandedProjectIDs.remove(project.id)
+                                        }
+                                    }
+                                ),
+                                onOpen: {
+                                    model.selectedProjectID = project.id
+                                    expandedProjectIDs.insert(project.id)
+                                },
+                                onAddRecording: {
+                                    model.requestProjectCommand(.importMedia(project.id))
+                                    expandedProjectIDs.insert(project.id)
+                                },
+                                onDelete: {
+                                    projectPendingDeletion = project
+                                }
+                            )
                         }
                     }
+                }
+
+                Section("Capture") {
+                    MacCaptureCard()
+                        .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+                        .listRowBackground(Color.clear)
                 }
             }
             .listStyle(.sidebar)
@@ -56,6 +89,7 @@ struct MacContentView: View {
                     Label("New Project", systemImage: "plus")
                 }
                 .disabled(model.isWorking)
+                .creatorHelp("Create a project inside the local workspace.")
 
                 Button {
                     Task {
@@ -67,16 +101,22 @@ struct MacContentView: View {
                     }
                 } label: {
                     Label(
-                        model.isRecording ? "Stop Recording" : "Record",
-                        systemImage: model.isRecording ? "stop.circle.fill" : "record.circle"
+                        recordActionTitle,
+                        systemImage: recordActionIcon
                     )
                 }
-                .tint(model.isRecording ? .red : .accentColor)
+                .buttonStyle(.borderedProminent)
+                .tint(recordActionColor)
                 .disabled(model.captureIsBusy)
+                .creatorHelp(recordActionHelp)
             }
         }
         .task {
+            model.enableCaptureShortcuts()
             await model.refresh()
+            if let selectedProjectID = model.selectedProjectID {
+                expandedProjectIDs.insert(selectedProjectID)
+            }
             await model.watchCaptureInbox()
         }
         .sheet(isPresented: $model.isPresentingNewProject) {
@@ -111,6 +151,52 @@ struct MacContentView: View {
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
         )
+    }
+
+    private var recordActionTitle: String {
+        switch model.captureState {
+        case .recording: "Stop Recording"
+        case .preparing: "Preparing…"
+        case .stopping: "Stopping…"
+        case .importing: "Saving…"
+        case .finalized: "New Recording"
+        case .failed: "Retry Recording"
+        case .storageConstrained: "Low Storage"
+        default: "Record"
+        }
+    }
+
+    private var recordActionIcon: String {
+        switch model.captureState {
+        case .recording: "stop.circle.fill"
+        case .preparing: "hourglass.circle.fill"
+        case .stopping: "stop.circle.fill"
+        case .importing: "arrow.down.circle.fill"
+        case .finalized: "checkmark.circle.fill"
+        case .failed, .storageConstrained: "exclamationmark.triangle.fill"
+        default: "record.circle"
+        }
+    }
+
+    private var recordActionColor: Color {
+        switch model.captureState {
+        case .recording, .failed: .red
+        case .preparing, .stopping, .importing, .storageConstrained: .orange
+        case .finalized: .green
+        case .recovered: .blue
+        default: .red
+        }
+    }
+
+    private var recordActionHelp: String {
+        switch model.captureState {
+        case .recording: "Stop the current screen recording and safely save its local segments."
+        case .preparing, .stopping, .importing: "Capture is already in progress. Creator Studio is keeping the local recording safe."
+        case .finalized: "Start another local screen recording."
+        case .storageConstrained: "Free disk space before starting another screen recording."
+        case .failed: "Try a new recording after reviewing the capture message."
+        default: "Choose a display, window, or app to start a new screen recording."
+        }
     }
 }
 
@@ -156,6 +242,34 @@ struct MacSettingsView: View {
                 .padding(8)
             }
 
+            GroupBox("Pointer and focus") {
+                VStack(spacing: 0) {
+                    settingsRow(
+                        title: "Show cursor",
+                        detail: "Include the pointer in screen recordings.",
+                        isOn: $model.showCursor
+                    )
+                    Divider().padding(.leading, 42)
+                    settingsRow(
+                        title: "Highlight mouse clicks",
+                        detail: "Show a visible click pulse in the recorded video.",
+                        isOn: $model.highlightMouseClicks
+                    )
+                    Divider().padding(.leading, 42)
+                    settingsRow(
+                        title: "Track pointer motion",
+                        detail: "Keep local pointer movement metadata for focus suggestions.",
+                        isOn: $model.trackMouseMovements
+                    )
+                    Divider().padding(.leading, 42)
+                    settingsRow(
+                        title: "Automatic focus zooms",
+                        detail: "Create calm, editable zooms around clicks and focus markers after saving.",
+                        isOn: $model.automaticFocusZoom
+                    )
+                }
+            }
+
             GroupBox("Storage") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Projects and finished recordings are stored locally in Creator Studio's Application Support folder.")
@@ -174,7 +288,7 @@ struct MacSettingsView: View {
             Spacer(minLength: 0)
         }
         .padding(24)
-        .frame(width: 560, height: 400, alignment: .topLeading)
+        .frame(width: 560, height: 620, alignment: .topLeading)
         .onChange(of: model.includeSystemAudio) { _, _ in model.updatePreflight() }
         .onChange(of: model.includeMicrophone) { _, _ in model.updatePreflight() }
     }
@@ -186,7 +300,7 @@ struct MacSettingsView: View {
     ) -> some View {
         Toggle(isOn: isOn) {
             HStack(spacing: 12) {
-                Image(systemName: title == "Microphone" ? "mic" : "speaker.wave.2")
+                Image(systemName: settingsIcon(for: title))
                     .font(.title3)
                     .foregroundStyle(.tint)
                     .frame(width: 30)
@@ -202,6 +316,17 @@ struct MacSettingsView: View {
         .toggleStyle(.switch)
         .padding(10)
     }
+
+    private func settingsIcon(for title: String) -> String {
+        switch title {
+        case "Microphone": "mic"
+        case "Show cursor": "cursorarrow"
+        case "Highlight mouse clicks": "cursorarrow.click"
+        case "Track pointer motion": "point.3.connected.trianglepath.dotted"
+        case "Automatic focus zooms": "viewfinder.circle"
+        default: "speaker.wave.2"
+        }
+    }
 }
 
 private struct MacCaptureCard: View {
@@ -211,27 +336,71 @@ private struct MacCaptureCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: statusIcon)
-                    .foregroundStyle(statusColor)
-                Text(statusTitle)
-                    .font(.headline)
+                ZStack {
+                    Circle()
+                        .fill(statusColor.opacity(0.16))
+                        .frame(width: 28, height: 28)
+                    Image(systemName: statusIcon)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(statusColor)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(statusTitle)
+                        .font(.headline)
+                    Text(statusLabel)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(statusColor)
+                }
                 Spacer()
                 if model.captureIsBusy {
-                    ProgressView().controlSize(.small)
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(statusColor)
                 }
             }
 
             Text(model.captureMessage)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(statusMessageColor)
                 .fixedSize(horizontal: false, vertical: true)
+
+            Button {
+                Task {
+                    if model.isRecording {
+                        await model.stopCapture()
+                    } else {
+                        await model.beginCapture()
+                    }
+                }
+            } label: {
+                Label(captureActionTitle, systemImage: captureActionIcon)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(captureActionColor)
+            .disabled(model.captureIsBusy)
+            .creatorHelp(captureActionHelp)
 
             HStack {
                 Toggle("System audio", isOn: $model.includeSystemAudio)
+                    .creatorHelp("Include audio supplied by the selected app, window, or display.")
                 Toggle("Microphone", isOn: $model.includeMicrophone)
+                    .creatorHelp("Include microphone audio. macOS asks for permission when recording begins.")
             }
             .toggleStyle(.checkbox)
             .disabled(model.isRecording || model.captureIsBusy)
+
+            if model.isRecording {
+                Button {
+                    model.markFocusAtCurrentCursor()
+                } label: {
+                    Label("Mark Focus", systemImage: "viewfinder.circle")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .creatorHelp("Add an editable focus zoom at the current cursor position. Shortcut: Command-Shift-F.")
+            }
 
             if let preflight = model.preflight {
                 Label(
@@ -243,24 +412,31 @@ private struct MacCaptureCard: View {
             }
 
             if model.isRecording {
-                Label(
-                    model.liveCaptureSources.contains(.screen)
-                        ? "Video frames arriving"
-                        : "Waiting for first video frame",
-                    systemImage: model.liveCaptureSources.contains(.screen)
-                        ? "checkmark.circle.fill"
-                        : "clock"
-                )
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(model.liveCaptureSources.contains(.screen) ? Color.green : Color.secondary)
+                HStack(spacing: 6) {
+                    captureSignal(
+                        "Video",
+                        systemImage: "rectangle.inset.filled",
+                        isActive: model.liveCaptureSources.contains(.screen)
+                    )
+                    captureSignal(
+                        "System audio",
+                        systemImage: "speaker.wave.2.fill",
+                        isActive: model.liveCaptureSources.contains(.appAudio)
+                    )
+                    captureSignal(
+                        "Mic",
+                        systemImage: "mic.fill",
+                        isActive: model.liveCaptureSources.contains(.microphone)
+                    )
+                }
             }
 
-            if !model.importableCaptures.isEmpty {
+            if !model.recoveryCaptures.isEmpty {
                 Divider()
                 Text("Recovery recordings")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                ForEach(model.importableCaptures, id: \.sessionID) { item in
+                ForEach(model.recoveryCaptures, id: \.sessionID) { item in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.status == .recovered ? "Recovered recording" : "Screen recording")
@@ -270,26 +446,30 @@ private struct MacCaptureCard: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Save") {
+                        Button("Save to Unlisted") {
                             Task { await model.importCapture(item) }
                         }
                         .controlSize(.small)
                         .disabled(model.isWorking || model.isRecording)
-                        .help("Copy this recovered recording into a new local project")
+                        .creatorHelp("Copy this recovered recording into Unlisted Recordings")
                         Button(role: .destructive) {
                             capturePendingDeletion = item
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
-                        .help("Delete this unimported recording and its recovery files")
+                        .creatorHelp("Delete this unimported recording and its recovery files")
                         .disabled(model.isWorking || model.isRecording)
                     }
                 }
             }
         }
         .padding(12)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .background(statusColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(statusColor.opacity(0.22), lineWidth: 1)
+        }
         .onChange(of: model.includeSystemAudio) { _, _ in model.updatePreflight() }
         .onChange(of: model.includeMicrophone) { _, _ in model.updatePreflight() }
         .confirmationDialog(
@@ -338,37 +518,218 @@ private struct MacCaptureCard: View {
     private var statusColor: Color {
         switch model.captureState {
         case .recording, .failed: .red
-        case .storageConstrained: .orange
+        case .preparing, .stopping, .importing, .storageConstrained: .orange
         case .recovered: .blue
         case .finalized: .green
-        default: .accentColor
+        default: .secondary
         }
+    }
+
+    private var statusLabel: String {
+        switch model.captureState {
+        case .recording: "Live local capture"
+        case .preparing: "Waiting for permission"
+        case .stopping: "Finalizing media"
+        case .importing: "Saving a recording"
+        case .finalized: "Safely saved on this Mac"
+        case .recovered: "Recovery action needed"
+        case .storageConstrained: "Capture paused for safety"
+        case .failed: "Needs your attention"
+        default: "Ready when you are"
+        }
+    }
+
+    private var statusMessageColor: Color {
+        switch model.captureState {
+        case .failed, .storageConstrained: statusColor
+        default: .secondary
+        }
+    }
+
+    private var captureActionTitle: String {
+        switch model.captureState {
+        case .recording: "Stop and Save Recording"
+        case .preparing: "Preparing Capture…"
+        case .stopping: "Stopping Capture…"
+        case .importing: "Saving Recording…"
+        case .finalized: "Record Another Capture"
+        case .failed: "Retry Recording"
+        case .storageConstrained: "Check Storage and Retry"
+        default: "Start Screen Recording"
+        }
+    }
+
+    private var captureActionIcon: String {
+        switch model.captureState {
+        case .recording: "stop.fill"
+        case .preparing: "hourglass"
+        case .stopping: "stop.circle"
+        case .importing: "arrow.down.circle"
+        case .finalized: "record.circle"
+        case .failed, .storageConstrained: "arrow.clockwise.circle"
+        default: "record.circle"
+        }
+    }
+
+    private var captureActionColor: Color {
+        switch model.captureState {
+        case .recording, .failed: .red
+        case .preparing, .stopping, .importing, .storageConstrained: .orange
+        case .finalized: .green
+        case .recovered: .blue
+        default: .red
+        }
+    }
+
+    private var captureActionHelp: String {
+        switch model.captureState {
+        case .recording: "Stop the capture, finalize every segment, and save a new local recording."
+        case .preparing, .stopping, .importing: "Creator Studio is already processing this recording safely."
+        case .storageConstrained: "Free disk space, then retry a new screen recording."
+        case .failed: "Try another screen recording after reviewing the status message."
+        default: "Choose a display, application, or window in the system picker to start recording."
+        }
+    }
+
+    private func captureSignal(_ title: String, systemImage: String, isActive: Bool) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(isActive ? Color.green : Color.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(
+                isActive ? Color.green.opacity(0.12) : Color.secondary.opacity(0.08),
+                in: Capsule()
+            )
     }
 }
 
-private struct MacProjectRow: View {
-    let project: ProjectSummary
-    let onDelete: () -> Void
+private struct MacWorkspaceSummary: View {
+    let projectCount: Int
+    let recordingCount: Int
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: icon)
+            Image(systemName: "internaldrive")
                 .font(.title3)
                 .frame(width: 30, height: 30)
                 .background(.tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 2) {
-                Text(project.title).lineLimit(1)
-                Text("\(project.assetCount) source\(project.assetCount == 1 ? "" : "s") • \(project.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                Text("Local Workspace")
+                    .fontWeight(.medium)
+                Text("\(projectCount) project\(projectCount == 1 ? "" : "s") • \(recordingCount) recording\(recordingCount == 1 ? "" : "s")")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
+            Spacer(minLength: 0)
         }
         .padding(.vertical, 3)
+        .creatorHelp("Your local workspace contains projects, and each project contains one or more recordings. Nothing is uploaded.")
+    }
+}
+
+private struct MacProjectNavigationGroup: View {
+    let project: ProjectSummary
+    let isSelected: Bool
+    @Binding var isExpanded: Bool
+    let onOpen: () -> Void
+    let onAddRecording: () -> Void
+    let onDelete: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Button(action: onOpen) {
+                    HStack(spacing: 10) {
+                        Image(systemName: icon)
+                            .font(.title3)
+                            .frame(width: 30, height: 30)
+                            .background(.tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(project.title).lineLimit(1)
+                            Text(projectDetail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.vertical, 3)
+                }
+                .buttonStyle(.plain)
+                .background(
+                    isSelected ? Color.accentColor.opacity(0.16) : .clear,
+                    in: RoundedRectangle(cornerRadius: 8)
+                )
+                .creatorHelp("Open \(project.title) and its recordings.")
+
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 18, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .creatorHelp(isExpanded ? "Hide recordings in \(project.title)" : "Show recordings in \(project.title)")
+
+                Button(action: onAddRecording) {
+                    Image(systemName: "plus.circle")
+                        .frame(width: 20, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .creatorHelp("Add a video or audio recording to \(project.title)")
+
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "minus.circle")
+                        .frame(width: 20, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .creatorHelp("Delete \(project.title) and all recordings it owns")
+            }
+
+            if isExpanded {
+                if project.recordings.isEmpty {
+                    Label("No recordings yet", systemImage: "film")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 42)
+                        .padding(.vertical, 3)
+                } else {
+                    ForEach(project.recordings) { recording in
+                        Button(action: onOpen) {
+                            HStack(spacing: 8) {
+                                Image(systemName: recordingIcon(recording))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 20)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(recording.title).lineLimit(1)
+                                    Text(recordingDetail(recording))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                            .padding(.vertical, 3)
+                            .padding(.leading, 40)
+                        }
+                        .buttonStyle(.plain)
+                        .creatorHelp("Open \(recording.title) in \(project.title)")
+                    }
+                }
+            }
+        }
         .contextMenu {
+            Button("Add Recording…", action: onAddRecording)
             Button("Delete Project…", role: .destructive, action: onDelete)
         }
-        .help("Open \(project.title). Control-click for storage options.")
+    }
+
+    private var projectDetail: String {
+        "\(project.recordings.count) recording\(project.recordings.count == 1 ? "" : "s") • \(project.assetCount) source\(project.assetCount == 1 ? "" : "s")"
     }
 
     private var icon: String {
@@ -380,6 +741,18 @@ private struct MacProjectRow: View {
         case .audio: "waveform"
         case .importOnly: "square.and.arrow.down"
         }
+    }
+
+    private func recordingIcon(_ recording: ProjectRecordingSummary) -> String {
+        if recording.kinds.contains(.screenVideo) { return "rectangle.inset.filled.and.cursorarrow" }
+        if recording.kinds.contains(.cameraVideo) { return "video.fill" }
+        if recording.kinds.contains(.microphoneAudio) { return "mic.fill" }
+        if recording.kinds.contains(.appAudio) { return "speaker.wave.2.fill" }
+        return "music.note"
+    }
+
+    private func recordingDetail(_ recording: ProjectRecordingSummary) -> String {
+        "\(recording.assetCount) source\(recording.assetCount == 1 ? "" : "s") • \(Duration.seconds(recording.duration.seconds).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated)))"
     }
 }
 
@@ -509,7 +882,7 @@ private struct MacProjectDetailView: View {
                             model.ingestStatus[$0.id]?.isRunning == true
                         }) == true
                 )
-                .help("Remove only local proxy and waveform caches. Original recordings stay intact.")
+                .creatorHelp("Remove only local proxy and waveform caches. Original recordings stay intact.")
             }
             ToolbarItem(placement: .secondaryAction) {
                 Button {
@@ -521,7 +894,7 @@ private struct MacProjectDetailView: View {
                     workspace == nil || isImporting || isApplyingEdit || isMergingRecording
                         || mergeCandidates.isEmpty
                 )
-                .help("Append another saved Creator Studio recording to this project's master timeline.")
+                .creatorHelp("Append another saved Creator Studio recording to this project's master timeline.")
             }
             ToolbarItem(placement: .primaryAction) {
                 Menu {
@@ -541,7 +914,7 @@ private struct MacProjectDetailView: View {
                     workspace == nil || workspace?.project.assets.isEmpty == true || isImporting
                         || isApplyingEdit || isMergingRecording || isExporting
                 )
-                .help("Render the current master timeline as a local 1080p movie. Source recordings are never modified.")
+                .creatorHelp("Render the current master timeline as a local 1080p movie. Source recordings are never modified.")
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -550,6 +923,7 @@ private struct MacProjectDetailView: View {
                     Label("Undo", systemImage: "arrow.uturn.backward")
                 }
                 .disabled(workspace?.editHistory.canUndo != true || isApplyingEdit || isImporting)
+                .creatorHelp("Undo the last non-destructive timeline edit.")
 
                 Button {
                     Task { await redo() }
@@ -557,6 +931,7 @@ private struct MacProjectDetailView: View {
                     Label("Redo", systemImage: "arrow.uturn.forward")
                 }
                 .disabled(workspace?.editHistory.canRedo != true || isApplyingEdit || isImporting)
+                .creatorHelp("Redo the next timeline edit.")
 
                 Button {
                     isPresentingImporter = true
@@ -564,7 +939,7 @@ private struct MacProjectDetailView: View {
                     Label("Import Media", systemImage: "square.and.arrow.down")
                 }
                 .disabled(workspace == nil || isImporting || isApplyingEdit)
-                .help("Copy video or audio from Files into this project as immutable source media.")
+                .creatorHelp("Copy video or audio from Files into this project as immutable source media.")
             }
         }
         .fileImporter(
@@ -603,7 +978,13 @@ private struct MacProjectDetailView: View {
         } message: {
             Text("The selected project's visible clips will be copied into this project's master timeline. The original recording remains unchanged.")
         }
-        .task { await loadWorkspace() }
+        .task {
+            await loadWorkspace()
+            performPendingProjectCommand()
+        }
+        .onChange(of: model.projectCommand) { _, _ in
+            performPendingProjectCommand()
+        }
         .onChange(of: model.ingestStatus) { previous, current in
             guard let projectAssets = workspace?.project.assets,
                   let completedAsset = projectAssets.first(where: { asset in
@@ -666,7 +1047,7 @@ private struct MacProjectDetailView: View {
                     Label("Editor", systemImage: "timeline.selection").tag(MacWorkspaceTab.editor)
                 }
                 .pickerStyle(.segmented)
-                .help("Media manages source recordings. Editor arranges clips on the master timeline.")
+                .creatorHelp("Media manages source recordings. Editor arranges clips on the master timeline.")
 
                 if let statusMessage {
                     Label(statusMessage, systemImage: "checkmark.circle.fill")
@@ -746,7 +1127,7 @@ private struct MacProjectDetailView: View {
                             }
                         }
                     }
-                    .help("Sources are immutable copies stored in this project. Select one to preview it.")
+                    .creatorHelp("Sources are immutable copies stored in this project. Select one to preview it.")
                 }
 
                 if workspaceTab == .editor {
@@ -801,7 +1182,7 @@ private struct MacProjectDetailView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .help("Select a clip to reveal precise editing tools above. Rows play together on the shared project timeline.")
+                    .creatorHelp("Select a clip to reveal precise editing tools above. Rows play together on the shared project timeline.")
                 }
             }
             .padding(20)
@@ -859,10 +1240,12 @@ private struct MacProjectDetailView: View {
                                     Task { await trimStart(selection.clip, extending: true) }
                                 }
                                 .disabled(selection.clip.sourceRange.start == .zero)
+                                .creatorHelp("Reveal the previous half second without changing the source file.")
                                 Button("Trim 0.5s") {
                                     Task { await trimStart(selection.clip, extending: false) }
                                 }
                                 .disabled(selection.clip.sourceRange.duration.microseconds <= 500_000)
+                                .creatorHelp("Hide the first half second from this timeline clip.")
                             }
                         }
                         GridRow {
@@ -872,10 +1255,12 @@ private struct MacProjectDetailView: View {
                                     Task { await trimEnd(selection.clip, asset: asset, extending: false) }
                                 }
                                 .disabled(selection.clip.sourceRange.duration.microseconds <= 500_000)
+                                .creatorHelp("Hide the last half second from this timeline clip.")
                                 Button("Extend 0.5s") {
                                     Task { await trimEnd(selection.clip, asset: asset, extending: true) }
                                 }
                                 .disabled(sourceEnd(of: selection.clip) >= asset.duration)
+                                .creatorHelp("Reveal the next half second without changing the source file.")
                             }
                         }
                     }
@@ -898,6 +1283,7 @@ private struct MacProjectDetailView: View {
                                 Label("Split Clip", systemImage: "scissors")
                             }
                             .buttonStyle(.borderedProminent)
+                            .creatorHelp("Split this timeline reference at the chosen source time. The original recording stays intact.")
                         }
                     }
 
@@ -910,6 +1296,7 @@ private struct MacProjectDetailView: View {
                             Label("Earlier", systemImage: "arrow.left")
                         }
                         .disabled(selection.index == 0)
+                        .creatorHelp("Move this clip earlier in its track and close the gap.")
 
                         Button {
                             Task { await move(selection.clip, to: selection.index + 1) }
@@ -917,6 +1304,7 @@ private struct MacProjectDetailView: View {
                             Label("Later", systemImage: "arrow.right")
                         }
                         .disabled(selection.index == selection.track.clips.count - 1)
+                        .creatorHelp("Move this clip later in its track and close the gap.")
 
                         Spacer()
 
@@ -928,12 +1316,14 @@ private struct MacProjectDetailView: View {
                                 systemImage: selection.clip.isEnabled ? "eye.slash" : "eye"
                             )
                         }
+                        .creatorHelp(selection.clip.isEnabled ? "Hide this clip from export without deleting it." : "Include this clip in export again.")
 
                         Button(role: .destructive) {
                             Task { await deleteClip(selection.clip) }
                         } label: {
                             Label("Delete", systemImage: "trash")
                         }
+                        .creatorHelp("Remove this clip from the master timeline. Its source recording remains available and Undo restores it.")
                     }
                     .buttonStyle(.bordered)
                 }
@@ -1118,7 +1508,6 @@ private struct MacProjectDetailView: View {
         do {
             let loaded = try await model.loadWorkspace(id: projectID)
             workspace = loaded
-            model.ensureIngest(for: loaded)
             if let first = loaded.project.assets.first {
                 await select(first)
             }
@@ -1127,6 +1516,44 @@ private struct MacProjectDetailView: View {
             loadError = error.localizedDescription
         }
         isLoading = false
+    }
+
+    @MainActor
+    private func performPendingProjectCommand() {
+        guard let workspace,
+              let command = model.takeProjectCommand(for: projectID)
+        else { return }
+
+        switch command {
+        case .importMedia:
+            isPresentingImporter = true
+        case .mergeRecording:
+            isPresentingRecordingMerge = true
+        case .clearCache:
+            isPresentingCacheClear = true
+        case let .export(_, profile):
+            export(workspace: workspace, profile: profile)
+        case .undo:
+            Task { await undo() }
+        case .redo:
+            Task { await redo() }
+        case .showMedia:
+            workspaceTab = .media
+        case .showEditor:
+            workspaceTab = .editor
+        case .togglePlayback:
+            if let player {
+                if player.timeControlStatus == .playing {
+                    player.pause()
+                } else {
+                    player.play()
+                }
+            } else if let firstAsset = workspace.project.assets.first {
+                Task { await select(firstAsset) }
+            }
+        case let .stepPlayback(_, count):
+            player?.currentItem?.step(byCount: count)
+        }
     }
 
     @MainActor
@@ -1249,6 +1676,9 @@ private struct MacProjectDetailView: View {
 
     private func select(_ asset: SourceAsset, clip: TimelineClip? = nil) async {
         do {
+            if let workspace {
+                model.ensureIngest(for: workspace, assets: [asset])
+            }
             let url = try await model.previewURL(projectID: projectID, assetID: asset.id)
             player?.pause()
             selectedAssetID = asset.id
@@ -1381,9 +1811,16 @@ private struct MacNativePlayerView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
-        view.controlsStyle = .inline
+        // AVPlayerView is the supported in-app route to the familiar native
+        // QuickTime playback experience; the QuickTime Player app itself is
+        // not an embeddable module.
+        view.controlsStyle = .default
         view.videoGravity = .resizeAspect
+        view.showsFrameSteppingButtons = true
+        view.showsSharingServiceButton = true
         view.showsFullScreenToggleButton = true
+        view.showsTimecodes = true
+        view.allowsPictureInPicturePlayback = true
         view.player = player
         return view
     }
@@ -1396,6 +1833,15 @@ private struct MacNativePlayerView: NSViewRepresentable {
 
     static func dismantleNSView(_ view: AVPlayerView, coordinator: Void) {
         view.player = nil
+    }
+}
+
+private extension View {
+    /// Combines the native hover tooltip with an accessibility hint so the
+    /// control remains understandable to keyboard and assistive-tech users.
+    func creatorHelp(_ text: String) -> some View {
+        help(text)
+            .accessibilityHint(text)
     }
 }
 

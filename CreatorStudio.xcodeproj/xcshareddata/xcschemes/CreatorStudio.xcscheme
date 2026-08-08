@@ -14,7 +14,7 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
+               BlueprintIdentifier = "C941D445DB83500EB708FCC6"
                BuildableName = "CreatorStudio.app"
                BlueprintName = "CreatorStudio"
                ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -28,7 +28,7 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "925F8064721B1A2787718EF4"
+               BlueprintIdentifier = "1D98567AA74AA4A8AEE02047"
                BuildableName = "CreatorBroadcast.appex"
                BlueprintName = "CreatorBroadcast"
                ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -44,7 +44,7 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
+            BlueprintIdentifier = "C941D445DB83500EB708FCC6"
             BuildableName = "CreatorStudio.app"
             BlueprintName = "CreatorStudio"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -67,7 +67,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
+            BlueprintIdentifier = "C941D445DB83500EB708FCC6"
             BuildableName = "CreatorStudio.app"
             BlueprintName = "CreatorStudio"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
@@ -84,7 +84,7 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
+            BlueprintIdentifier = "C941D445DB83500EB708FCC6"
             BuildableName = "CreatorStudio.app"
             BlueprintName = "CreatorStudio"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">

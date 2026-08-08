@@ -98,6 +98,7 @@ mac_app.build_configurations.each do |config|
     "INFOPLIST_FILE" => "Apps/CreatorStudioMac/Info.plist",
     "CODE_SIGN_ENTITLEMENTS" => "Apps/CreatorStudioMac/CreatorStudioMac.entitlements",
     "MACOSX_DEPLOYMENT_TARGET" => "15.0",
+    "ASSETCATALOG_COMPILER_APPICON_NAME" => "AppIcon",
     "ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS" => "YES",
     "SKIP_INSTALL" => "NO"
   )
@@ -131,6 +132,8 @@ Dir.glob(File.join(ROOT, "Apps/CreatorStudioMac/Sources/*.swift")).sort.each do 
 end
 mac_app_group.new_file("Info.plist")
 mac_app_group.new_file("CreatorStudioMac.entitlements")
+mac_assets = mac_app_group.new_file("Assets.xcassets")
+mac_app.resources_build_phase.add_file_reference(mac_assets)
 
 extensions_group = project.main_group.new_group("Extensions", "Extensions")
 broadcast_group = extensions_group.new_group("CreatorBroadcast", "CreatorBroadcast")

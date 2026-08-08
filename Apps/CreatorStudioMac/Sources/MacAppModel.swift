@@ -28,7 +28,7 @@ private enum MacTimelineExportError: LocalizedError {
         case .noVideo:
             "Add at least one video clip before exporting a movie."
         case .unsupportedAdjustment:
-            "This first export supports trims, splits, ordering, and audio. Advanced visual adjustments need the next render slice."
+            "This export supports trims, splits, ordering, audio, and focus zooms. Captions and manual visual adjustments need the next render slice."
         case .compositionTrack:
             "Creator Studio could not create an export track."
         case .invalidVideoDimensions:
@@ -55,6 +55,32 @@ struct MacAssetIngestStatus: Hashable, Sendable {
     }
 }
 
+/// Routes menu-bar and sidebar quick actions to the currently open project
+/// detail without coupling the app scene to view-local presentation state.
+enum MacProjectCommand: Equatable {
+    case importMedia(ProjectID)
+    case mergeRecording(ProjectID)
+    case clearCache(ProjectID)
+    case export(ProjectID, ExportProfile)
+    case undo(ProjectID)
+    case redo(ProjectID)
+    case showMedia(ProjectID)
+    case showEditor(ProjectID)
+    case togglePlayback(ProjectID)
+    case stepPlayback(ProjectID, by: Int)
+
+    var projectID: ProjectID {
+        switch self {
+        case let .importMedia(id), let .mergeRecording(id), let .clearCache(id),
+             let .undo(id), let .redo(id), let .showMedia(id), let .showEditor(id),
+             let .togglePlayback(id), let .stepPlayback(id, _):
+            id
+        case let .export(id, _):
+            id
+        }
+    }
+}
+
 @MainActor
 final class MacAppModel: ObservableObject {
     @Published private(set) var projects: [ProjectSummary] = []
@@ -62,9 +88,14 @@ final class MacAppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isPresentingNewProject = false
     @Published private(set) var isWorking = false
+    @Published private(set) var projectCommand: MacProjectCommand?
 
     @Published var includeSystemAudio = true
     @Published var includeMicrophone = false
+    @Published var showCursor = true
+    @Published var highlightMouseClicks = true
+    @Published var trackMouseMovements = true
+    @Published var automaticFocusZoom = true
     @Published private(set) var captureState: CaptureState = .ready
     @Published private(set) var captureMessage = "Choose a window, application, or display when you are ready to record."
     @Published private(set) var captureInbox: [CaptureInboxItem] = []
@@ -83,6 +114,7 @@ final class MacAppModel: ObservableObject {
         }
     )
     private let captureInboxRoot: URL
+    private static let unlistedRecordingsTitle = "Unlisted Recordings"
     private struct PendingIngest {
         var projectID: ProjectID
         var asset: SourceAsset
@@ -91,6 +123,7 @@ final class MacAppModel: ObservableObject {
     private var ingestTasks: [AssetID: Task<Void, Never>] = [:]
     private var pendingIngest: [PendingIngest] = []
     private var activeIngestAssetID: AssetID?
+    private var globalHotKeys: MacGlobalHotKeyMonitor?
 
     init() {
         let fileManager = FileManager.default
@@ -133,10 +166,42 @@ final class MacAppModel: ObservableObject {
         captureInbox.filter(\.canImport)
     }
 
+    /// Completed captures bypass this list entirely and are saved immediately.
+    /// Only an interrupted, failed, or storage-constrained capture may need a
+    /// person to choose whether to preserve or delete its recovery material.
+    var recoveryCaptures: [CaptureInboxItem] {
+        captureInbox.filter {
+            $0.canImport && [.recovered, .storageConstrained, .failed].contains($0.status)
+        }
+    }
+
+    func enableCaptureShortcuts() {
+        guard globalHotKeys == nil else { return }
+        globalHotKeys = MacGlobalHotKeyMonitor { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .toggleRecording:
+                Task { await self.toggleCapture() }
+            case .markFocus:
+                self.markFocusAtCurrentCursor()
+            }
+        }
+    }
+
+    func toggleCapture() async {
+        if isRecording {
+            await stopCapture()
+        } else {
+            await beginCapture()
+        }
+    }
+
     func refresh() async {
         do {
-            projects = try await repository.list()
-            captureInbox = await captureImporter.discover()
+            async let listedProjects = repository.list()
+            async let discoveredCaptures = captureImporter.discover()
+            projects = try await listedProjects
+            captureInbox = await discoveredCaptures
             updatePreflight()
             if selectedProjectID == nil {
                 selectedProjectID = projects.first?.id
@@ -149,6 +214,17 @@ final class MacAppModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func requestProjectCommand(_ command: MacProjectCommand) {
+        selectedProjectID = command.projectID
+        projectCommand = command
+    }
+
+    func takeProjectCommand(for projectID: ProjectID) -> MacProjectCommand? {
+        guard let projectCommand, projectCommand.projectID == projectID else { return nil }
+        self.projectCommand = nil
+        return projectCommand
     }
 
     func watchCaptureInbox() async {
@@ -241,7 +317,7 @@ final class MacAppModel: ObservableObject {
             canvas: profile.canvas
         )
         try ExportPreflight().validate(plan: plan, profile: profile)
-        guard plan.focus.isEmpty, plan.captions.isEmpty,
+        guard plan.captions.isEmpty,
               plan.layers.allSatisfy({
                   $0.transform == ClipTransform() && $0.gainDB == 0
               })
@@ -294,9 +370,15 @@ final class MacAppModel: ObservableObject {
                 }
 
                 let instruction = AVMutableVideoCompositionLayerInstruction(assetTrack: destinationTrack)
-                instruction.setTransform(
-                    try await Self.exportTransform(for: videoTrack, canvas: profile.canvas),
-                    at: timelineRange.start
+                let baseTransform = try await Self.exportTransform(for: videoTrack, canvas: profile.canvas)
+                instruction.setTransform(baseTransform, at: timelineRange.start)
+                try await Self.applyFocusZooms(
+                    plan.focus,
+                    to: instruction,
+                    baseline: baseTransform,
+                    for: layer,
+                    track: videoTrack,
+                    canvas: profile.canvas
                 )
                 instruction.setOpacity(Float(layer.transform.opacity), at: timelineRange.start)
                 if timelineRange.end < composition.duration {
@@ -463,7 +545,10 @@ final class MacAppModel: ObservableObject {
 
         captureCoordinator.presentPicker(options: MacCaptureOptions(
             includeSystemAudio: includeSystemAudio,
-            includeMicrophone: includeMicrophone
+            includeMicrophone: includeMicrophone,
+            showCursor: showCursor,
+            highlightMouseClicks: highlightMouseClicks,
+            trackPointerMotion: trackMouseMovements || automaticFocusZoom
         ))
     }
 
@@ -474,8 +559,20 @@ final class MacAppModel: ObservableObject {
         await captureCoordinator.stop()
     }
 
+    func markFocusAtCurrentCursor() {
+        guard isRecording else {
+            errorMessage = "Start a screen recording before marking a focus point."
+            return
+        }
+        guard captureCoordinator.markFocusAtCurrentCursor() else {
+            errorMessage = "Pointer tracking is unavailable for this recording."
+            return
+        }
+        captureMessage = "Focus marker added at the current cursor position. Creator Studio will zoom there in the saved recording."
+    }
+
     func importCapture(_ item: CaptureInboxItem) async {
-        await saveCapture(item, discardingStagingCopy: false)
+        await saveCapture(item, discardingStagingCopy: true)
     }
 
     func discardCapture(_ item: CaptureInboxItem) async {
@@ -502,15 +599,42 @@ final class MacAppModel: ObservableObject {
         isWorking = true
         defer { isWorking = false }
 
-        var createdProjectID: ProjectID?
+        var createdUnlistedProjectID: ProjectID?
         do {
             let title = Self.recordingTitle(for: item)
-            let project = try await repository.create(title: title, intent: .tutorial)
-            createdProjectID = project.id
-            let result = try await captureImporter.importSession(id: item.sessionID, into: project.id)
+            let destination = try await unlistedRecordingsProject()
+            if destination.wasCreated {
+                createdUnlistedProjectID = destination.project.id
+            }
+            let pointerEvents = automaticFocusZoom
+                ? MacPointerTracker.loadEvents(from: captureSessionDirectory(id: item.sessionID))
+                : []
+            let result = try await captureImporter.importSession(
+                id: item.sessionID,
+                into: destination.project.id,
+                recordingName: title
+            )
             projects = try await repository.list()
-            selectedProjectID = project.id
-            let workspace = try await repository.loadWorkspace(id: project.id)
+            selectedProjectID = destination.project.id
+            var workspace = try await repository.loadWorkspace(id: destination.project.id)
+            let focusEvents = Self.focusEvents(
+                from: pointerEvents,
+                importedAssets: result.importedAssets,
+                in: workspace
+            )
+            if !focusEvents.isEmpty {
+                do {
+                    workspace = try await repository.applyTimelineCommand(
+                        .addFocusEvents(focusEvents),
+                        to: destination.project.id
+                    )
+                    projects = try await repository.list()
+                } catch {
+                    // The source recording is already safely imported. Keep it
+                    // usable if optional focus metadata is malformed.
+                    errorMessage = "The recording was saved, but its optional focus markers could not be added: \(error.localizedDescription)"
+                }
+            }
             ensureIngest(for: workspace, assets: result.importedAssets)
             captureState = .finalized
             if discardingStagingCopy {
@@ -518,11 +642,11 @@ final class MacAppModel: ObservableObject {
             }
             captureInbox = await captureImporter.discover()
             captureMessage = result.wasRecovered
-                ? "Saved \(title) from recovered local media."
-                : "Saved \(title) as a new local recording."
+                ? "Saved \(title) from recovered local media in Unlisted Recordings."
+                : "Saved \(title) in Unlisted Recordings."
         } catch {
-            if let createdProjectID {
-                try? await repository.delete(id: createdProjectID)
+            if let createdUnlistedProjectID {
+                try? await repository.delete(id: createdUnlistedProjectID)
             }
             captureState = .failed
             captureMessage = "Import failed validation. The recording remains untouched in the recovery inbox."
@@ -582,7 +706,7 @@ final class MacAppModel: ObservableObject {
             }
         case let .stopped(sessionID):
             captureState = .importing
-            captureMessage = "Recording stopped safely. Saving it as a new local project…"
+            captureMessage = "Recording stopped safely. Saving it in Unlisted Recordings…"
             Task { await automaticallySaveCompletedCapture(sessionID: sessionID) }
         case let .interrupted(message):
             captureState = .recovered
@@ -599,10 +723,15 @@ final class MacAppModel: ObservableObject {
     }
 
     private func automaticallySaveCompletedCapture(sessionID: UUID) async {
-        captureInbox = await captureImporter.discover()
-        guard let item = captureInbox.first(where: { $0.sessionID == sessionID }) else {
+        guard let item = await captureImporter.discoverSession(id: sessionID) else {
             captureState = .failed
             captureMessage = "The finished recording could not be found in local storage."
+            return
+        }
+        captureInbox = await captureImporter.discover()
+        guard item.status == .completed else {
+            captureState = .recovered
+            captureMessage = "The recording did not finalize normally. Its committed media is available in recovery."
             return
         }
         await saveCapture(item, discardingStagingCopy: true)
@@ -613,7 +742,7 @@ final class MacAppModel: ObservableObject {
             [.year, .month, .day, .hour, .minute, .second],
             from: item.startedAt
         )
-        let prefix = item.status == .recovered ? "Recovered Recording" : "Recording"
+        let prefix = item.status == .recovered ? "Recovered Screen Recording" : "Screen Recording"
         return String(
             format: "%@ %04d-%02d-%02d %02d.%02d.%02d",
             prefix,
@@ -624,6 +753,69 @@ final class MacAppModel: ObservableObject {
             components.minute ?? 0,
             components.second ?? 0
         )
+    }
+
+    private func unlistedRecordingsProject() async throws -> (project: StudioProject, wasCreated: Bool) {
+        if let summary = try await repository.list().first(where: {
+            $0.title == Self.unlistedRecordingsTitle && $0.intent == .importOnly
+        }) {
+            return (try await repository.load(id: summary.id), false)
+        }
+        return (
+            try await repository.create(title: Self.unlistedRecordingsTitle, intent: .importOnly),
+            true
+        )
+    }
+
+    private func captureSessionDirectory(id: UUID) -> URL {
+        captureInboxRoot.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
+    }
+
+    private static func focusEvents(
+        from pointerEvents: [MacPointerEvent],
+        importedAssets: [SourceAsset],
+        in workspace: ProjectWorkspace
+    ) -> [FocusEvent] {
+        guard let sessionStart = workspace.timeline.tracks
+            .flatMap(\.clips)
+            .filter({ clip in importedAssets.contains(where: { $0.id == clip.assetID }) })
+            .map(\.timelineStart)
+            .min()
+        else { return [] }
+
+        let candidates = pointerEvents
+            .filter { $0.kind == .click || $0.kind == .focus }
+            .sorted { $0.time < $1.time }
+
+        var lastFocusTime = -Double.infinity
+        var focusEvents: [FocusEvent] = []
+        for candidate in candidates {
+            // Click clusters are usually one interaction. Keep the focus motion
+            // calm by requiring a small dwell between automatic zooms; explicit
+            // focus shortcut markers can always be added.
+            if candidate.kind == .click, candidate.time - lastFocusTime < 1.7 {
+                continue
+            }
+            let size = candidate.kind == .focus ? 0.38 : 0.46
+            let region = NormalizedRect(
+                x: candidate.x - size / 2,
+                y: candidate.y - size / 2,
+                width: size,
+                height: size
+            ).clampedToFrame()
+            focusEvents.append(FocusEvent(
+                timeRange: StudioTimeRange(
+                    start: sessionStart + StudioTime(seconds: max(0, candidate.time - 0.12)),
+                    duration: StudioTime(seconds: candidate.kind == .focus ? 2.0 : 1.6)
+                ),
+                region: region,
+                strength: candidate.kind == .focus ? 1 : 0.78,
+                source: candidate.kind == .focus ? .manual : .interactionEvent,
+                confidence: candidate.kind == .focus ? 1 : 0.9
+            ))
+            lastFocusTime = candidate.time
+        }
+        return focusEvents
     }
 
     private func startIngest(projectID: ProjectID, asset: SourceAsset) {
@@ -767,6 +959,111 @@ final class MacAppModel: ObservableObject {
             .concatenating(CGAffineTransform(translationX: -orientedRect.minX, y: -orientedRect.minY))
             .concatenating(CGAffineTransform(scaleX: scale, y: scale))
             .concatenating(CGAffineTransform(translationX: centeredX, y: centeredY))
+    }
+
+    /// Applies short, comfortable transform ramps around pointer-derived focus
+    /// events. These are non-destructive timeline instructions: the source
+    /// movie stays untouched and a user can undo the focus command later.
+    private static func applyFocusZooms(
+        _ focusEvents: [FocusInstruction],
+        to instruction: AVMutableVideoCompositionLayerInstruction,
+        baseline: CGAffineTransform,
+        for layer: RenderLayer,
+        track: AVAssetTrack,
+        canvas: CanvasSpec
+    ) async throws {
+        guard layer.trackKind == .screen else { return }
+
+        let layerStart = layer.timelineRange.start
+        let layerEnd = layer.timelineRange.end
+        var nextAvailableStart = layerStart
+
+        for event in focusEvents {
+            let eventStart = max(event.timeRange.start, layerStart)
+            let eventEnd = min(event.timeRange.end, layerEnd)
+            let start = max(eventStart, nextAvailableStart)
+            guard start < eventEnd else { continue }
+
+            let focusedTransform = try await focusTransform(
+                for: track,
+                baseline: baseline,
+                canvas: canvas,
+                region: event.region,
+                strength: event.strength
+            )
+            let duration = eventEnd - start
+            let rampDuration = StudioTime(seconds: min(0.18, duration.seconds / 3))
+            let rampInEnd = start + rampDuration
+            let rampOutStart = max(rampInEnd, eventEnd - rampDuration)
+
+            if rampDuration > .zero {
+                instruction.setTransformRamp(
+                    fromStart: baseline,
+                    toEnd: focusedTransform,
+                    timeRange: CMTimeRange(
+                        start: cmTime(start),
+                        duration: cmTime(rampDuration)
+                    )
+                )
+            } else {
+                instruction.setTransform(focusedTransform, at: cmTime(start))
+            }
+            instruction.setTransform(focusedTransform, at: cmTime(rampInEnd))
+            if eventEnd > rampOutStart {
+                instruction.setTransformRamp(
+                    fromStart: focusedTransform,
+                    toEnd: baseline,
+                    timeRange: CMTimeRange(
+                        start: cmTime(rampOutStart),
+                        duration: cmTime(eventEnd - rampOutStart)
+                    )
+                )
+            }
+            instruction.setTransform(baseline, at: cmTime(eventEnd))
+            nextAvailableStart = eventEnd
+        }
+    }
+
+    private static func focusTransform(
+        for track: AVAssetTrack,
+        baseline: CGAffineTransform,
+        canvas: CanvasSpec,
+        region: NormalizedRect,
+        strength: Double
+    ) async throws -> CGAffineTransform {
+        let naturalSize = try await track.load(.naturalSize)
+        let preferredTransform = try await track.load(.preferredTransform)
+        let orientedRect = CGRect(origin: .zero, size: naturalSize)
+            .applying(preferredTransform)
+            .standardized
+        guard orientedRect.width > 0, orientedRect.height > 0 else {
+            throw MacTimelineExportError.invalidVideoDimensions
+        }
+
+        let scale = min(
+            CGFloat(canvas.width) / orientedRect.width,
+            CGFloat(canvas.height) / orientedRect.height
+        )
+        let centeredX = (CGFloat(canvas.width) - orientedRect.width * scale) / 2
+        let centeredY = (CGFloat(canvas.height) - orientedRect.height * scale) / 2
+        let clamped = region.clampedToFrame()
+        let centerX = CGFloat(clamped.origin.x + clamped.size.width / 2)
+        let centerY = CGFloat(clamped.origin.y + clamped.size.height / 2)
+        let focusX = centeredX + centerX * orientedRect.width * scale
+        let focusY = centeredY + (1 - centerY) * orientedRect.height * scale
+        let zoom = CGFloat(1 + min(max(strength, 0), 1) * 0.75)
+
+        // Scaling each affine component and compensating its translation is the
+        // same as post-scaling the baseline composition around the focus point.
+        // It keeps the selected pointer location stable while the frame grows.
+        return CGAffineTransform(
+            a: baseline.a * zoom,
+            b: baseline.b * zoom,
+            c: baseline.c * zoom,
+            d: baseline.d * zoom,
+            tx: (baseline.tx - focusX) * zoom + focusX,
+            ty: (baseline.ty - focusY) * zoom + focusY
+        )
     }
 
     private func thermalState() -> CaptureThermalState {

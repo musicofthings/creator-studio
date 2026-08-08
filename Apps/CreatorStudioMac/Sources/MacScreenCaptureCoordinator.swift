@@ -8,6 +8,9 @@ import StudioDomain
 struct MacCaptureOptions: Hashable, Sendable {
     var includeSystemAudio: Bool
     var includeMicrophone: Bool
+    var showCursor: Bool
+    var highlightMouseClicks: Bool
+    var trackPointerMotion: Bool
 }
 
 enum MacCaptureEvent: Sendable {
@@ -44,9 +47,16 @@ final class MacScreenCaptureCoordinator: NSObject {
         }
     }
 
-    private var options = MacCaptureOptions(includeSystemAudio: true, includeMicrophone: true)
+    private var options = MacCaptureOptions(
+        includeSystemAudio: true,
+        includeMicrophone: false,
+        showCursor: true,
+        highlightMouseClicks: true,
+        trackPointerMotion: true
+    )
     private var stream: SCStream?
     private var pipeline: CaptureWriterPipeline<MacCaptureSample>?
+    private var pointerTracker: MacPointerTracker?
     private var activeSessionID: UUID?
     private var isStopping = false
     private var observesPicker = false
@@ -102,6 +112,13 @@ final class MacScreenCaptureCoordinator: NSObject {
         } catch {
             await interrupt(detail: error.localizedDescription)
         }
+    }
+
+    @discardableResult
+    func markFocusAtCurrentCursor() -> Bool {
+        guard activeSessionID != nil, let pointerTracker else { return false }
+        pointerTracker.markFocusAtCurrentCursor()
+        return true
     }
 
     private func startCapture(with filter: SCContentFilter) async {
@@ -176,6 +193,12 @@ final class MacScreenCaptureCoordinator: NSObject {
             )
 
             let configuration = try streamConfiguration(for: filter, options: options)
+            let tracker = options.trackPointerMotion
+                ? MacPointerTracker(
+                    sessionDirectoryURL: createdPersistence.directoryURL,
+                    contentRect: filter.contentRect
+                )
+                : nil
             let createdStream = SCStream(
                 filter: filter,
                 configuration: configuration,
@@ -208,9 +231,11 @@ final class MacScreenCaptureCoordinator: NSObject {
             }
 
             pipeline = createdPipeline
+            pointerTracker = tracker
             activeSessionID = createdPersistence.manifest.sessionID
             stream = createdStream
             isStopping = false
+            tracker?.start()
             try await createdStream.startCapture()
             onEvent(.recording(createdPersistence.manifest.sessionID))
         } catch {
@@ -244,6 +269,8 @@ final class MacScreenCaptureCoordinator: NSObject {
     }
 
     private func clearActiveCapture() {
+        pointerTracker?.stop()
+        pointerTracker = nil
         stream = nil
         pipeline = nil
         activeSessionID = nil
@@ -287,8 +314,8 @@ final class MacScreenCaptureCoordinator: NSObject {
         configuration.height = dimensions.height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         configuration.queueDepth = 5
-        configuration.showsCursor = true
-        configuration.showMouseClicks = true
+        configuration.showsCursor = options.showCursor
+        configuration.showMouseClicks = options.highlightMouseClicks
         configuration.capturesAudio = options.includeSystemAudio
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48000

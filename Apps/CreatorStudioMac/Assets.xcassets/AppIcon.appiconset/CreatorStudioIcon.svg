@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="background" x1="128" y1="112" x2="896" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17345A"/>
+      <stop offset="1" stop-color="#0A1424"/>
+    </linearGradient>
+    <linearGradient id="monogram" x1="314" y1="278" x2="702" y2="730" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7FBFF"/>
+      <stop offset="1" stop-color="#C7DDF0"/>
+    </linearGradient>
+    <filter id="shadow" x="170" y="170" width="684" height="684" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#020814" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#background)"/>
+  <rect x="46" y="46" width="932" height="932" rx="184" stroke="#8EB7DD" stroke-opacity="0.18" stroke-width="4"/>
+  <g filter="url(#shadow)">
+    <path d="M704 324C655 278 589 252 516 252C365 252 242 375 242 526C242 677 365 800 516 800C589 800 655 772 704 728C720 714 730 693 730 671C730 625 693 588 647 588H528C493 588 464 559 464 524C464 489 493 460 528 460H647C693 460 730 423 730 377C730 358 720 337 704 324ZM516 676C433 676 366 609 366 526C366 443 433 376 516 376C541 376 564 382 585 393L535 443C522 456 514 474 514 493V555C514 575 522 593 536 607L585 657C564 668 541 676 516 676Z" fill="url(#monogram)"/>
+    <circle cx="706" cy="318" r="74" fill="#FF5B5B" stroke="#FFF6F4" stroke-width="18"/>
+    <circle cx="706" cy="318" r="20" fill="#FFF6F4" fill-opacity="0.94"/>
+  </g>
+  <path d="M276 766C341 832 423 872 516 872C609 872 691 832 756 766" stroke="#77A9D4" stroke-opacity="0.34" stroke-width="12" stroke-linecap="round"/>
+</svg>

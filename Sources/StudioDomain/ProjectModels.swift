@@ -180,12 +180,41 @@ public struct StudioProject: Hashable, Codable, Sendable {
     }
 }
 
+/// A lightweight recording grouping for library navigation. Captured screen,
+/// application-audio, and microphone assets from one session are presented as
+/// one recording; unrelated imports remain separate recording entries.
+public struct ProjectRecordingSummary: Hashable, Codable, Sendable, Identifiable {
+    public var id: String
+    public var title: String
+    public var assetCount: Int
+    public var duration: StudioTime
+    public var createdAt: Date
+    public var kinds: [MediaKind]
+
+    public init(
+        id: String,
+        title: String,
+        assetCount: Int,
+        duration: StudioTime,
+        createdAt: Date,
+        kinds: [MediaKind]
+    ) {
+        self.id = id
+        self.title = title
+        self.assetCount = assetCount
+        self.duration = duration
+        self.createdAt = createdAt
+        self.kinds = kinds
+    }
+}
+
 public struct ProjectSummary: Hashable, Codable, Sendable, Identifiable {
     public var id: ProjectID
     public var title: String
     public var intent: ProjectIntent
     public var updatedAt: Date
     public var assetCount: Int
+    public var recordings: [ProjectRecordingSummary]
 
     public init(project: StudioProject) {
         self.id = project.id
@@ -193,5 +222,38 @@ public struct ProjectSummary: Hashable, Codable, Sendable, Identifiable {
         self.intent = project.intent
         self.updatedAt = project.updatedAt
         self.assetCount = project.assets.count
+        let groupedAssets = Dictionary(grouping: project.assets) { asset in
+            if let sessionID = asset.captureSessionID {
+                return "capture-\(sessionID.uuidString.lowercased())"
+            }
+            return "asset-\(asset.id.description)"
+        }
+        recordings = groupedAssets.map { id, assets in
+            let orderedAssets = assets.sorted { $0.createdAt < $1.createdAt }
+            let firstAsset = orderedAssets[0]
+            let isCapture = firstAsset.captureSessionID != nil
+            let captureFilename = assets.first(where: { $0.kind == .screenVideo })?.originalFilename
+                ?? firstAsset.originalFilename
+            let title: String = if isCapture,
+                                   let captureFilename,
+                                   captureFilename.hasPrefix("Screen Recording ") || captureFilename.hasPrefix("Recovered Screen Recording ") {
+                URL(fileURLWithPath: captureFilename)
+                    .deletingPathExtension()
+                    .lastPathComponent
+            } else if isCapture, assets.count > 1 {
+                "Captured recording"
+            } else {
+                firstAsset.originalFilename ?? "Imported recording"
+            }
+            return ProjectRecordingSummary(
+                id: id,
+                title: title,
+                assetCount: assets.count,
+                duration: assets.map(\.duration).max() ?? .zero,
+                createdAt: firstAsset.createdAt,
+                kinds: Array(Set(assets.map(\.kind))).sorted { $0.rawValue < $1.rawValue }
+            )
+        }
+        .sorted { $0.createdAt > $1.createdAt }
     }
 }

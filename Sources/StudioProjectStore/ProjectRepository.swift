@@ -675,7 +675,9 @@ public actor FileProjectRepository: ProjectRepository {
 
     /// Capture import establishes a synchronized baseline rather than a series
     /// of user edits. Segment clips keep their shared session timestamps so a
-    /// microphone or application-audio offset is not collapsed to zero.
+    /// microphone or application-audio offset is not collapsed to zero. Later
+    /// captures append as their own synchronized block, which lets the local
+    /// Unlisted Recordings project safely hold more than one recording.
     public func bootstrapCaptureAssets(
         _ assets: [SourceAsset],
         sessionID: UUID,
@@ -693,11 +695,8 @@ public actor FileProjectRepository: ProjectRepository {
         }
 
         let original = try await loadWorkspace(id: projectID)
-        let unrelatedAssets = original.project.assets.filter { $0.captureSessionID != sessionID }
-        guard unrelatedAssets.isEmpty else {
-            throw ProjectStoreError.invalidProject(
-                "A capture baseline can only be created in an empty project package."
-            )
+        guard !original.project.assets.contains(where: { $0.captureSessionID == sessionID }) else {
+            throw ProjectStoreError.invalidProject("This capture session is already present in the project.")
         }
 
         let sortedAssets = assets.sorted { lhs, rhs in
@@ -710,28 +709,30 @@ public actor FileProjectRepository: ProjectRepository {
             return lhs.relativePath < rhs.relativePath
         }
 
-        var timeline = TimelineDocument(
-            id: original.timeline.id,
-            projectID: original.timeline.projectID,
-            revision: original.timeline.revision
-        )
-        var durations: [AssetID: StudioTime] = [:]
+        var timeline = original.timeline
+        var durations = try assetDurations(in: original.project)
         for asset in sortedAssets {
             guard durations.updateValue(asset.duration, forKey: asset.id) == nil else {
                 throw ProjectStoreError.invalidProject("Capture assets contain duplicate identifiers.")
             }
         }
+
+        let timelineEnd = original.timeline.tracks
+            .flatMap(\.clips)
+            .map(\.timelineRange.end)
+            .max() ?? .zero
+        let sessionOrigin = sortedAssets.map { $0.captureStart ?? .zero }.min() ?? .zero
         for asset in sortedAssets {
             timeline = try TimelineEditor().placingCapturedAsset(
                 asset,
-                at: asset.captureStart ?? .zero,
+                at: timelineEnd + ((asset.captureStart ?? .zero) - sessionOrigin),
                 in: timeline,
                 assetDurations: durations
             ).timeline
         }
 
         var project = original.project
-        project.assets = sortedAssets
+        project.assets.append(contentsOf: sortedAssets)
         project.updatedAt = now
         let updated = ProjectWorkspace(
             project: project,

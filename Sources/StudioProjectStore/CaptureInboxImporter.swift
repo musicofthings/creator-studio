@@ -210,9 +210,19 @@ public actor CaptureInboxImporter {
         return items.sorted { $0.updatedAt > $1.updatedAt }
     }
 
+    /// Forces a fresh manifest read for one session. A deliberate stop writes
+    /// `finalized` immediately before the app imports it; relying on the normal
+    /// discovery cache in that narrow window can otherwise expose the prior
+    /// `recording` state and incorrectly send a completed capture to recovery.
+    public func discoverSession(id: UUID, now: Date = .studioNow()) -> CaptureInboxItem? {
+        discoveryCache.removeValue(forKey: id)
+        return discover(now: now).first(where: { $0.sessionID == id })
+    }
+
     public func importSession(
         id: UUID,
         into projectID: ProjectID,
+        recordingName: String? = nil,
         now: Date = .studioNow()
     ) async throws -> CaptureImportResult {
         let directory = inboxRootURL.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
@@ -236,7 +246,7 @@ public actor CaptureInboxImporter {
         }
 
         let inboxItem = item(for: manifest, now: now)
-        guard inboxItem.status != .recording else {
+        guard inboxItem.status != .recording, inboxItem.status != .stopping else {
             throw CaptureImportError.sessionStillRecording(id)
         }
         guard !manifest.files.isEmpty else {
@@ -307,7 +317,11 @@ public actor CaptureInboxImporter {
                     id: assetID,
                     kind: Self.mediaKind(for: file.segment.source),
                     relativePath: "sources/\(destination.lastPathComponent)",
-                    originalFilename: file.url.lastPathComponent,
+                    originalFilename: Self.recordingFilename(
+                        recordingName,
+                        source: file.segment.source,
+                        fallback: file.url.lastPathComponent
+                    ),
                     byteCount: file.segment.byteCount,
                     contentHash: "sha256:\(copiedHash)",
                     duration: file.segment.duration,
@@ -324,6 +338,11 @@ public actor CaptureInboxImporter {
             try copyJournalIfPresent(
                 from: directory,
                 relativePath: manifest.eventsRelativePath,
+                to: packageURL,
+                sessionID: id
+            )
+            try copyPointerEventsIfPresent(
+                from: directory,
                 to: packageURL,
                 sessionID: id
             )
@@ -502,6 +521,44 @@ public actor CaptureInboxImporter {
         if fileManager.fileExists(atPath: destination.path) { return }
         try fileManager.copyItem(at: source, to: destination)
         try? fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: destination.path)
+    }
+
+    private func copyPointerEventsIfPresent(
+        from sessionDirectory: URL,
+        to packageURL: URL,
+        sessionID: UUID
+    ) throws {
+        let source = sessionDirectory.appendingPathComponent("cursor-events.jsonl")
+        guard fileManager.fileExists(atPath: source.path) else { return }
+        guard let values = try? source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true
+        else {
+            throw CaptureImportError.invalidFile("cursor-events.jsonl")
+        }
+        let destination = packageURL
+            .appendingPathComponent("events", isDirectory: true)
+            .appendingPathComponent("cursor-\(sessionID.uuidString.lowercased()).jsonl")
+        guard !fileManager.fileExists(atPath: destination.path) else { return }
+        try fileManager.copyItem(at: source, to: destination)
+        try? fileManager.setAttributes([.posixPermissions: 0o444], ofItemAtPath: destination.path)
+    }
+
+    private static func recordingFilename(
+        _ recordingName: String?,
+        source: CaptureSource,
+        fallback: String
+    ) -> String {
+        guard let recordingName else { return fallback }
+        let suffix = switch source {
+        case .screen: ""
+        case .appAudio: " - System Audio"
+        case .microphone: " - Microphone"
+        case .camera: " - Camera"
+        case .interactionEvents: " - Interactions"
+        }
+        let fileExtension = URL(fileURLWithPath: fallback).pathExtension
+        return "\(recordingName)\(suffix).\(fileExtension)"
     }
 
     private func acknowledgeImport(at directory: URL) -> Bool {

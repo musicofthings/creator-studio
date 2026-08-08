@@ -69,6 +69,12 @@ import Testing
     #expect(result.workspace.timeline.tracks.first?.clips == [result.appendedClip])
     #expect(try Data(contentsOf: source) == sourceData)
 
+    let summary = try #require((try await repository.list()).first)
+    #expect(summary.recordings.count == 1)
+    #expect(summary.recordings[0].title == "lesson.mov")
+    #expect(summary.recordings[0].assetCount == 1)
+    #expect(summary.recordings[0].duration == StudioTime(seconds: 6))
+
     let importedURL = try await repository.assetURL(
         projectID: project.id,
         assetID: result.importedAsset.id

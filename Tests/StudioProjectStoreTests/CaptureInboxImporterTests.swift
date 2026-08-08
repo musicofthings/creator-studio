@@ -71,6 +71,11 @@ import Testing
     #expect(workspace.timeline.tracks[1].clips[0].timelineStart == StudioTime(microseconds: 8000))
     #expect(workspace.timeline.tracks[2].clips[0].timelineStart == StudioTime(microseconds: 15000))
     #expect(workspace.editHistory.undoStack.isEmpty)
+
+    let summary = try #require((try await fixture.repository.list()).first)
+    #expect(summary.recordings.count == 1)
+    #expect(summary.recordings[0].assetCount == 3)
+    #expect(summary.recordings[0].duration == StudioTime(seconds: 2))
 }
 
 @Test func importsCommittedMediaAfterInjectedInterruption() async throws {
@@ -84,6 +89,63 @@ import Testing
     let result = try await fixture.importer.importSession(id: session.id, into: project.id)
     #expect(result.wasRecovered)
     #expect(result.importedAssets.count == 1)
+}
+
+@Test func forcedSessionDiscoveryReadsTheFinalizedManifestInsteadOfCachedRecordingState() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let persistence = try fixture.persistence()
+    let media = Data("finalized-after-cache".utf8)
+    let mediaURL = persistence.directoryURL.appendingPathComponent("segments/screen-0000.mov")
+    try media.write(to: mediaURL)
+    try persistence.commit(CaptureSegment(
+        source: .screen,
+        relativePath: "segments/screen-0000.mov",
+        sha256: fixture.sha256(media),
+        byteCount: Int64(media.count),
+        start: .zero,
+        duration: StudioTime(seconds: 2)
+    ))
+
+    #expect((await fixture.importer.discover()).first?.status == .recording)
+    try persistence.recordLifecycle(.finalized, state: .finalized)
+
+    let finalized = await fixture.importer.discoverSession(id: persistence.manifest.sessionID)
+    #expect(finalized?.status == .completed)
+}
+
+@Test func appendsMultipleCapturesToOneUnlistedProjectAsSeparateRecordings() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let first = try fixture.makeSession(state: .finalized)
+    let second = try fixture.makeSession(state: .finalized)
+    let unlisted = try await fixture.repository.create(title: "Unlisted Recordings", intent: .importOnly)
+
+    _ = try await fixture.importer.importSession(
+        id: first.id,
+        into: unlisted.id,
+        recordingName: "Screen Recording 2026-08-08 17.42.10"
+    )
+    _ = try await fixture.importer.importSession(
+        id: second.id,
+        into: unlisted.id,
+        recordingName: "Screen Recording 2026-08-08 17.42.15"
+    )
+
+    let workspace = try await fixture.repository.loadWorkspace(id: unlisted.id)
+    #expect(workspace.project.assets.count == 2)
+    #expect(Set(workspace.project.assets.compactMap(\.captureSessionID)) == Set([first.id, second.id]))
+    #expect(workspace.timeline.tracks.flatMap(\.clips).count == 2)
+    #expect(workspace.timeline.tracks.flatMap(\.clips).map(\.timelineStart).sorted() == [
+        .zero,
+        StudioTime(seconds: 3),
+    ])
+
+    let summary = try #require((try await fixture.repository.list()).first)
+    #expect(Set(summary.recordings.map(\.title)) == Set([
+        "Screen Recording 2026-08-08 17.42.15",
+        "Screen Recording 2026-08-08 17.42.10",
+    ]))
 }
 
 @Test func discardingACompletedSessionRemovesOnlyTheRecoveryInboxCopy() async throws {
