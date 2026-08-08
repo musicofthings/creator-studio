@@ -356,6 +356,7 @@ public actor FileProjectRepository: ProjectRepository {
                 contentHash: "sha256:\(copied.digest)",
                 duration: descriptor.duration,
                 pixelSize: descriptor.pixelSize,
+                mediaMetadata: descriptor.mediaMetadata,
                 createdAt: now
             )
             let edit = try TimelineEditor().appending(
@@ -452,6 +453,134 @@ public actor FileProjectRepository: ProjectRepository {
         return url
     }
 
+    /// Returns only validated, package-owned paths for rebuildable ingest work.
+    /// The cache directory may be removed at any time without affecting project
+    /// semantics; the immutable source path remains separately validated.
+    public func assetIngestLocation(
+        projectID: ProjectID,
+        assetID: AssetID
+    ) async throws -> ProjectAssetIngestLocation {
+        let sourceURL = try await assetURL(projectID: projectID, assetID: assetID)
+        let package = packageURL(for: projectID)
+        let relativePath = "cache/\(assetID.description)"
+        let cacheDirectory = try Self.safeRelativeURL(
+            relativePath,
+            inside: package,
+            fileManager: fileManager
+        )
+        do {
+            try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        } catch {
+            throw ProjectStoreError.writeFailed(error.localizedDescription)
+        }
+        guard let values = try? cacheDirectory.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ),
+            values.isDirectory == true,
+            values.isSymbolicLink != true
+        else {
+            throw ProjectStoreError.invalidProject("The asset cache path is unsafe.")
+        }
+        return ProjectAssetIngestLocation(
+            sourceURL: sourceURL,
+            cacheDirectoryURL: cacheDirectory
+        )
+    }
+
+    /// Persists inspection results without changing source bytes or edit timing.
+    /// Capture-manifest durations remain the canonical clip bounds; inspected
+    /// source timing is retained alongside them for preview/render mapping.
+    public func updateMediaMetadata(
+        _ metadata: SourceMediaMetadata,
+        displayPixelSize: PixelSize?,
+        projectID: ProjectID,
+        assetID: AssetID,
+        now: Date = .studioNow()
+    ) async throws -> ProjectWorkspace {
+        try Self.validate(metadata: metadata, displayPixelSize: displayPixelSize)
+        let original = try await loadWorkspace(id: projectID)
+        guard let index = original.project.assets.firstIndex(where: { $0.id == assetID }) else {
+            throw ProjectStoreError.invalidProject("The project does not contain this source asset.")
+        }
+        var updated = original
+        updated.project.assets[index].mediaMetadata = metadata
+        if updated.project.assets[index].pixelSize == nil {
+            updated.project.assets[index].pixelSize = displayPixelSize
+        }
+        updated.project.updatedAt = now
+        try writeProject(updated.project)
+        return updated
+    }
+
+    /// Capture import establishes a synchronized baseline rather than a series
+    /// of user edits. Segment clips keep their shared session timestamps so a
+    /// microphone or application-audio offset is not collapsed to zero.
+    public func bootstrapCaptureAssets(
+        _ assets: [SourceAsset],
+        sessionID: UUID,
+        into projectID: ProjectID,
+        now: Date = .studioNow()
+    ) async throws -> ProjectWorkspace {
+        guard !assets.isEmpty,
+              assets.allSatisfy({
+                  $0.captureSessionID == sessionID
+                      && $0.duration > .zero
+                      && ($0.captureStart ?? .zero) >= .zero
+              })
+        else {
+            throw ProjectStoreError.invalidProject("Capture assets do not share a valid session clock.")
+        }
+
+        let original = try await loadWorkspace(id: projectID)
+        let unrelatedAssets = original.project.assets.filter { $0.captureSessionID != sessionID }
+        guard unrelatedAssets.isEmpty else {
+            throw ProjectStoreError.invalidProject(
+                "A capture baseline can only be created in an empty project package."
+            )
+        }
+
+        let sortedAssets = assets.sorted { lhs, rhs in
+            let lhsStart = lhs.captureStart ?? .zero
+            let rhsStart = rhs.captureStart ?? .zero
+            if lhsStart != rhsStart { return lhsStart < rhsStart }
+            let lhsRank = Self.captureTrackRank(lhs.kind)
+            let rhsRank = Self.captureTrackRank(rhs.kind)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.relativePath < rhs.relativePath
+        }
+
+        var timeline = TimelineDocument(
+            id: original.timeline.id,
+            projectID: original.timeline.projectID,
+            revision: original.timeline.revision
+        )
+        var durations: [AssetID: StudioTime] = [:]
+        for asset in sortedAssets {
+            guard durations.updateValue(asset.duration, forKey: asset.id) == nil else {
+                throw ProjectStoreError.invalidProject("Capture assets contain duplicate identifiers.")
+            }
+        }
+        for asset in sortedAssets {
+            timeline = try TimelineEditor().placingCapturedAsset(
+                asset,
+                at: asset.captureStart ?? .zero,
+                in: timeline,
+                assetDurations: durations
+            ).timeline
+        }
+
+        var project = original.project
+        project.assets = sortedAssets
+        project.updatedAt = now
+        let updated = ProjectWorkspace(
+            project: project,
+            timeline: timeline,
+            editHistory: TimelineEditHistory(timeline: timeline)
+        )
+        try persist(updated, replacing: original)
+        return updated
+    }
+
     private func createPackageDirectories(for id: ProjectID) throws {
         let package = packageURL(for: id)
         do {
@@ -520,6 +649,35 @@ public actor FileProjectRepository: ProjectRepository {
             ["png", "jpg", "jpeg", "heic", "heif"]
         case .overlay:
             []
+        }
+    }
+
+    private static func captureTrackRank(_ kind: MediaKind) -> Int {
+        switch kind {
+        case .screenVideo: 0
+        case .cameraVideo: 1
+        case .appAudio: 2
+        case .microphoneAudio: 3
+        case .music: 4
+        case .image, .overlay: 5
+        }
+    }
+
+    private static func validate(
+        metadata: SourceMediaMetadata,
+        displayPixelSize: PixelSize?
+    ) throws {
+        guard metadata.preferredTransform.isFinite,
+              metadata.sourceDuration > .zero,
+              metadata.nominalFrameRate.map({ $0.isFinite && $0 > 0 }) ?? true,
+              metadata.estimatedFrameRate.map({ $0.isFinite && $0 > 0 }) ?? true,
+              metadata.naturalPixelSize.map({ $0.width > 0 && $0.height > 0 }) ?? true,
+              displayPixelSize.map({ $0.width > 0 && $0.height > 0 }) ?? true,
+              metadata.audioFormat.map({
+                  $0.sampleRate.isFinite && $0.sampleRate > 0 && $0.channelCount > 0
+              }) ?? true
+        else {
+            throw ProjectStoreError.invalidProject("The inspected media metadata is invalid.")
         }
     }
 

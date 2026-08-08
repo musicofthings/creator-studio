@@ -55,6 +55,12 @@ public enum TimelineCommand: Hashable, Codable, Sendable {
         trackOrder: Int,
         clip: TimelineClip
     )
+    case placeClip(
+        trackID: TrackID,
+        trackKind: TrackKind,
+        trackOrder: Int,
+        clip: TimelineClip
+    )
     case trim(clipID: ClipID, sourceRange: StudioTimeRange)
     case split(clipID: ClipID, sourceTime: StudioTime, trailingClipID: ClipID)
     case move(clipID: ClipID, toIndex: Int)
@@ -198,6 +204,52 @@ public struct TimelineEditor: Sendable {
         return TimelineAppendResult(timeline: edited, clip: appended, command: command)
     }
 
+    /// Places captured segments on their original session clock. Unlike a
+    /// user-driven append, this deliberately preserves gaps and cross-source
+    /// offsets instead of rippling every track back to zero.
+    public func placingCapturedAsset(
+        _ asset: SourceAsset,
+        at timelineStart: StudioTime,
+        in timeline: TimelineDocument,
+        assetDurations: [AssetID: StudioTime] = [:]
+    ) throws -> TimelineAppendResult {
+        guard asset.duration > .zero, timelineStart >= .zero else {
+            throw TimelineEditError.invalidAssetDuration(asset.id)
+        }
+
+        let trackKind = Self.trackKind(for: asset.kind)
+        let track: TimelineTrack
+        if let existing = timeline.tracks.first(where: { $0.kind == trackKind }) {
+            track = existing
+        } else {
+            let highestOrder = timeline.tracks.map(\.order).max() ?? -1
+            guard highestOrder < Int.max else { throw TimelineEditError.invalidTimeline }
+            track = TimelineTrack(kind: trackKind, order: highestOrder + 1)
+        }
+
+        let clip = TimelineClip(
+            assetID: asset.id,
+            sourceRange: StudioTimeRange(start: .zero, duration: asset.duration),
+            timelineStart: timelineStart
+        )
+        let command = TimelineCommand.placeClip(
+            trackID: track.id,
+            trackKind: track.kind,
+            trackOrder: track.order,
+            clip: clip
+        )
+        var allAssetDurations = assetDurations
+        allAssetDurations[asset.id] = asset.duration
+        let edited = try applying(command, to: timeline, assetDurations: allAssetDurations)
+        guard let placed = edited.tracks
+            .flatMap(\.clips)
+            .first(where: { $0.id == clip.id })
+        else {
+            throw TimelineEditError.invalidTimeline
+        }
+        return TimelineAppendResult(timeline: edited, clip: placed, command: command)
+    }
+
     public func performing(
         _ command: TimelineCommand,
         on timeline: TimelineDocument,
@@ -279,6 +331,36 @@ public struct TimelineEditor: Sendable {
             try Self.requireUnlocked(timeline.tracks[trackIndex])
             timeline.tracks[trackIndex].clips.append(clip)
             try Self.ripple(trackAt: trackIndex, in: &timeline, assetDurations: assetDurations)
+
+        case let .placeClip(trackID, trackKind, trackOrder, clip):
+            guard !timeline.tracks.flatMap(\.clips).contains(where: { $0.id == clip.id }) else {
+                throw TimelineEditError.duplicateClip(clip.id)
+            }
+            try Self.validate(clip: clip, assetDurations: assetDurations)
+
+            let trackIndex: Int
+            if let existing = timeline.tracks.firstIndex(where: { $0.id == trackID }) {
+                guard timeline.tracks[existing].kind == trackKind,
+                      timeline.tracks[existing].order == trackOrder
+                else {
+                    throw TimelineEditError.invalidTimeline
+                }
+                trackIndex = existing
+            } else {
+                guard trackOrder >= 0,
+                      !timeline.tracks.contains(where: { $0.kind == trackKind || $0.order == trackOrder })
+                else {
+                    throw TimelineEditError.invalidTimeline
+                }
+                timeline.tracks.append(TimelineTrack(id: trackID, kind: trackKind, order: trackOrder))
+                trackIndex = timeline.tracks.count - 1
+            }
+            try Self.requireUnlocked(timeline.tracks[trackIndex])
+            timeline.tracks[trackIndex].clips.append(clip)
+            timeline.tracks[trackIndex].clips.sort {
+                if $0.timelineStart != $1.timelineStart { return $0.timelineStart < $1.timelineStart }
+                return $0.id.description < $1.id.description
+            }
 
         case let .trim(clipID, sourceRange):
             let location = try Self.location(of: clipID, in: timeline)

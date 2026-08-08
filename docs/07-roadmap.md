@@ -94,6 +94,8 @@ Meet PRD launch readiness; no P0/P1 data-loss/privacy/accessibility issue; 100 c
 - [x] Preserve unexpected ScreenCaptureKit stops as interrupted, recoverable sessions rather than finalized recordings.
 - [x] Reuse the validated inbox importer to create immutable project sources and deterministic timeline tracks.
 - [x] Add a desktop project library, media import, source preview, and timeline overview.
+- [x] Inspect and persist orientation, presentation-time, variable-frame-rate, and audio-format metadata without transcoding source media.
+- [x] Generate cancellable, content-keyed editing proxies and waveform caches with progress, retry, and relaunch reuse in the macOS workspace.
 - [ ] Run a signed app with Screen Recording and microphone permissions; qualify real screen/system-audio/mic buffers, protected content, A/V offset/drift, and multi-display sizing.
 - [ ] Add editable pointer/click event metadata, keyboard callouts, dedicated camera capture, menu bar controls, and external-drive/project-handoff workflows.
 - [ ] Bring the full timeline command inspector and precision desktop editing interactions to the macOS UI.
@@ -150,7 +152,7 @@ Remote source recovery survives network loss; live latency/thermal/reconnect SLO
 ### Sprint 2
 
 - [x] Import capture artifact into immutable project sources.
-- [ ] Generate proxy/waveform cache products from imported sources.
+- [x] Generate proxy/waveform cache products from imported sources on macOS; iOS scheduling and thumbnail/analysis-audio products remain.
 - [x] Add viewer/timeline shell and deterministic trim/split/reorder/delete/undo commands; manual focus event remains.
 - Compile a render plan for 16:9 and 9:16 and export both.
 - [x] Add deterministic extension/host interruption recovery tests.

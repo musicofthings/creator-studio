@@ -2,6 +2,7 @@ import AVFoundation
 import AVKit
 import StudioCapture
 import StudioDomain
+import StudioMediaPipeline
 import StudioProjectStore
 import SwiftUI
 import UniformTypeIdentifiers
@@ -362,6 +363,26 @@ private struct MacProjectDetailView: View {
             }
         }
         .task { await loadWorkspace() }
+        .onChange(of: model.ingestStatus) { previous, current in
+            guard let projectAssets = workspace?.project.assets,
+                  let completedAsset = projectAssets.first(where: { asset in
+                      let assetID = asset.id
+                      return previous[assetID]?.phase != .complete
+                          && current[assetID]?.phase == .complete
+                  })
+            else { return }
+            Task {
+                if let refreshed = try? await model.loadWorkspace(id: projectID) {
+                    workspace = refreshed
+                    if selectedAssetID == completedAsset.id,
+                       let refreshedAsset = refreshed.project.assets.first(where: {
+                           $0.id == completedAsset.id
+                       }) {
+                        await select(refreshedAsset)
+                    }
+                }
+            }
+        }
         .onDisappear { player?.pause() }
     }
 
@@ -412,29 +433,58 @@ private struct MacProjectDetailView: View {
                     } else {
                         VStack(spacing: 0) {
                             ForEach(workspace.project.assets, id: \.id) { asset in
-                                Button {
-                                    Task { await select(asset) }
-                                } label: {
-                                    HStack {
-                                        Image(systemName: icon(for: asset.kind))
-                                            .frame(width: 28)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(asset.originalFilename ?? asset.relativePath)
-                                                .lineLimit(1)
-                                            Text(sourceDetail(asset))
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
+                                HStack(spacing: 10) {
+                                    Button {
+                                        Task { await select(asset) }
+                                    } label: {
+                                        HStack {
+                                            Image(systemName: icon(for: asset.kind))
+                                                .frame(width: 28)
+                                            VStack(alignment: .leading, spacing: 3) {
+                                                Text(asset.originalFilename ?? asset.relativePath)
+                                                    .lineLimit(1)
+                                                Text(sourceDetail(asset))
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                if let status = model.ingestStatus[asset.id] {
+                                                    Label(status.message, systemImage: ingestIcon(status.phase))
+                                                        .font(.caption2)
+                                                        .foregroundStyle(ingestColor(status.phase))
+                                                        .lineLimit(1)
+                                                }
+                                            }
+                                            Spacer()
+                                            if selectedAssetID == asset.id {
+                                                Image(systemName: "checkmark.circle.fill")
+                                                    .foregroundStyle(.tint)
+                                            }
                                         }
-                                        Spacer()
-                                        if selectedAssetID == asset.id {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundStyle(.tint)
-                                        }
+                                        .contentShape(Rectangle())
+                                        .padding(.vertical, 8)
                                     }
-                                    .contentShape(Rectangle())
-                                    .padding(.vertical, 8)
+                                    .buttonStyle(.plain)
+
+                                    if let status = model.ingestStatus[asset.id], status.isRunning {
+                                        ProgressView(value: status.fractionCompleted)
+                                            .frame(width: 68)
+                                        Button {
+                                            model.cancelIngest(assetID: asset.id)
+                                        } label: {
+                                            Image(systemName: "xmark.circle")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Cancel rebuildable cache generation")
+                                    } else if let status = model.ingestStatus[asset.id],
+                                              status.phase == .failed || status.phase == .canceled {
+                                        Button {
+                                            model.ensureIngest(for: workspace, assets: [asset])
+                                        } label: {
+                                            Image(systemName: "arrow.clockwise.circle")
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Retry ingest")
+                                    }
                                 }
-                                .buttonStyle(.plain)
                                 Divider()
                             }
                         }
@@ -451,13 +501,7 @@ private struct MacProjectDetailView: View {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: 6) {
                                         ForEach(track.clips) { clip in
-                                            Text(assetName(clip.assetID, in: workspace))
-                                                .font(.caption)
-                                                .lineLimit(1)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 8)
-                                                .frame(width: clipWidth(clip), alignment: .leading)
-                                                .background(.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+                                            clipTile(clip, in: workspace)
                                         }
                                     }
                                 }
@@ -486,6 +530,7 @@ private struct MacProjectDetailView: View {
         do {
             let loaded = try await model.loadWorkspace(id: projectID)
             workspace = loaded
+            model.ensureIngest(for: loaded)
             if let first = loaded.project.assets.first {
                 await select(first)
             }
@@ -524,46 +569,35 @@ private struct MacProjectDetailView: View {
     }
 
     private func inspectMedia(at url: URL, intent: ProjectIntent) async throws -> MediaImportDescriptor {
-        let media = AVURLAsset(url: url)
-        let duration = try await media.load(.duration)
-        let seconds = duration.seconds
-        guard seconds.isFinite, seconds > 0 else {
-            throw ProjectMediaImportError.invalidDuration
-        }
-
-        if let track = try await media.loadTracks(withMediaType: .video).first {
-            let naturalSize = try await track.load(.naturalSize)
-            let transform = try await track.load(.preferredTransform)
-            let transformed = CGRect(origin: .zero, size: naturalSize).applying(transform).standardized
-            let pixelSize = PixelSize(
-                width: Int(transformed.width.rounded()),
-                height: Int(transformed.height.rounded())
-            )
+        let inspection = try await AVAssetMediaInspector().inspect(url)
+        if inspection.hasVideo {
             let kind: MediaKind = switch intent {
             case .camera, .podcast: .cameraVideo
             default: .screenVideo
             }
             return MediaImportDescriptor(
                 kind: kind,
-                duration: StudioTime(seconds: seconds),
-                pixelSize: pixelSize,
+                duration: inspection.duration,
+                pixelSize: inspection.displayPixelSize,
+                mediaMetadata: inspection.metadata,
                 originalFilename: url.lastPathComponent
             )
         }
 
-        guard !(try await media.loadTracks(withMediaType: .audio)).isEmpty else {
+        guard inspection.hasAudio else {
             throw ProjectMediaImportError.unsupportedFileType(url.pathExtension)
         }
         return MediaImportDescriptor(
             kind: intent == .audio || intent == .podcast ? .microphoneAudio : .music,
-            duration: StudioTime(seconds: seconds),
+            duration: inspection.duration,
+            mediaMetadata: inspection.metadata,
             originalFilename: url.lastPathComponent
         )
     }
 
     private func select(_ asset: SourceAsset) async {
         do {
-            let url = try await model.assetURL(projectID: projectID, assetID: asset.id)
+            let url = try await model.previewURL(projectID: projectID, assetID: asset.id)
             player?.pause()
             selectedAssetID = asset.id
             player = AVPlayer(url: url)
@@ -579,6 +613,13 @@ private struct MacProjectDetailView: View {
         }
         if let byteCount = asset.byteCount {
             details.append(ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file))
+        }
+        if asset.mediaMetadata?.isVariableFrameRate == true {
+            details.append("variable frame rate")
+        }
+        if let audio = asset.mediaMetadata?.audioFormat {
+            details.append("\(Int(audio.sampleRate.rounded())) Hz")
+            details.append("\(audio.channelCount) ch")
         }
         return details.joined(separator: " • ")
     }
@@ -596,6 +637,57 @@ private struct MacProjectDetailView: View {
         min(max(CGFloat(clip.timelineDuration.seconds) * 18, 100), 260)
     }
 
+    private func clipTile(_ clip: TimelineClip, in workspace: ProjectWorkspace) -> some View {
+        let waveform = model.ingestStatus[clip.assetID]?.result?.waveform
+        return ZStack(alignment: .leading) {
+            if let waveform, !waveform.points.isEmpty {
+                MacWaveformStrip(points: waveform.points)
+                    .padding(.horizontal, 6)
+                    .opacity(0.75)
+            }
+            Text(assetName(clip.assetID, in: workspace))
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+        }
+        .frame(width: clipWidth(clip), height: 38, alignment: .leading)
+        .background(.tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(alignment: .bottomTrailing) {
+            if clip.timelineStart > .zero {
+                Text("+\(timelineOffsetLabel(clip.timelineStart))")
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+            }
+        }
+    }
+
+    private func timelineOffsetLabel(_ time: StudioTime) -> String {
+        if time.microseconds < 1_000_000 {
+            return "\(time.microseconds / 1000) ms"
+        }
+        return String(format: "%.2f s", time.seconds)
+    }
+
+    private func ingestIcon(_ phase: MacAssetIngestPhase) -> String {
+        switch phase {
+        case .complete: "checkmark.circle.fill"
+        case .failed: "exclamationmark.triangle.fill"
+        case .canceled: "pause.circle"
+        case .queued, .inspecting, .generating: "gearshape.2"
+        }
+    }
+
+    private func ingestColor(_ phase: MacAssetIngestPhase) -> Color {
+        switch phase {
+        case .complete: .green
+        case .failed: .red
+        case .canceled: .orange
+        case .queued, .inspecting, .generating: .secondary
+        }
+    }
+
     private func icon(for kind: MediaKind) -> String {
         switch kind {
         case .screenVideo: "rectangle.inset.filled.and.cursorarrow"
@@ -606,5 +698,29 @@ private struct MacProjectDetailView: View {
         case .image: "photo.fill"
         case .overlay: "square.on.square"
         }
+    }
+}
+
+private struct MacWaveformStrip: View {
+    let points: [WaveformPoint]
+
+    var body: some View {
+        Canvas { context, size in
+            guard !points.isEmpty, size.width > 0, size.height > 0 else { return }
+            let step = max(1, points.count / max(1, Int(size.width)))
+            let visible = Swift.stride(from: 0, to: points.count, by: step).map { points[$0] }
+            guard !visible.isEmpty else { return }
+            var path = Path()
+            let xStep = size.width / CGFloat(max(visible.count - 1, 1))
+            for (index, point) in visible.enumerated() {
+                let x = CGFloat(index) * xStep
+                let top = (1 - CGFloat(point.maximum + 1) / 2) * size.height
+                let bottom = (1 - CGFloat(point.minimum + 1) / 2) * size.height
+                path.move(to: CGPoint(x: x, y: top))
+                path.addLine(to: CGPoint(x: x, y: bottom))
+            }
+            context.stroke(path, with: .color(.accentColor.opacity(0.65)), lineWidth: 1)
+        }
+        .allowsHitTesting(false)
     }
 }

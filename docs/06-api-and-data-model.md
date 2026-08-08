@@ -14,7 +14,7 @@
 | Entity | Key fields | Notes |
 |---|---|---|
 | `StudioProject` | id, title, intent, canvas, assets, timelineID, timestamps, schema versions | Root package manifest |
-| `SourceAsset` | id, mediaKind, relativePath, contentHash, duration, dimensions, audio format, capture metadata | Immutable; file may be offline/missing |
+| `SourceAsset` | id, mediaKind, relativePath, contentHash, duration, natural/display dimensions, preferred transform, presentation-time/frame-rate mapping, audio format, capture metadata | Immutable; file may be offline/missing; proxy/waveform paths stay out of authoritative state |
 | `TimelineDocument` | id, projectID, tracks, focusEvents, captions, annotations, outputOverrides | Canonical non-destructive edit |
 | `Track` | id, kind, order, muted, locked, clips | Screen, camera, mic, app audio, music, overlay |
 | `Clip` | id, assetID, sourceRange, timelineStart, speed, transform, gain | Instance of a source range |

@@ -21,17 +21,20 @@ public struct MediaImportDescriptor: Hashable, Sendable {
     public var kind: MediaKind
     public var duration: StudioTime
     public var pixelSize: PixelSize?
+    public var mediaMetadata: SourceMediaMetadata?
     public var originalFilename: String?
 
     public init(
         kind: MediaKind,
         duration: StudioTime,
         pixelSize: PixelSize? = nil,
+        mediaMetadata: SourceMediaMetadata? = nil,
         originalFilename: String? = nil
     ) {
         self.kind = kind
         self.duration = duration
         self.pixelSize = pixelSize
+        self.mediaMetadata = mediaMetadata
         self.originalFilename = originalFilename
     }
 }
@@ -49,6 +52,16 @@ public struct ProjectMediaImportResult: Hashable, Sendable {
         self.workspace = workspace
         self.importedAsset = importedAsset
         self.appendedClip = appendedClip
+    }
+}
+
+public struct ProjectAssetIngestLocation: Hashable, Sendable {
+    public var sourceURL: URL
+    public var cacheDirectoryURL: URL
+
+    public init(sourceURL: URL, cacheDirectoryURL: URL) {
+        self.sourceURL = sourceURL
+        self.cacheDirectoryURL = cacheDirectoryURL
     }
 }
 

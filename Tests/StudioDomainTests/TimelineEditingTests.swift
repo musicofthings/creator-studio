@@ -47,6 +47,44 @@ import Testing
     #expect(withAudio.timeline.tracks[1].clips[0].timelineStart == .zero)
 }
 
+@Test func capturedAssetsPreserveTheirSharedSessionClock() throws {
+    let projectID = ProjectID()
+    let timeline = TimelineDocument(id: TimelineID(), projectID: projectID)
+    let screen = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/screen.mov",
+        duration: StudioTime(seconds: 10),
+        captureStart: .zero
+    )
+    let microphone = SourceAsset(
+        kind: .microphoneAudio,
+        relativePath: "sources/microphone.m4a",
+        duration: StudioTime(seconds: 9.5),
+        captureStart: StudioTime(microseconds: 15000)
+    )
+    let durations = [screen.id: screen.duration, microphone.id: microphone.duration]
+
+    let withScreen = try TimelineEditor().placingCapturedAsset(
+        screen,
+        at: screen.captureStart ?? .zero,
+        in: timeline,
+        assetDurations: durations
+    )
+    let withMicrophone = try TimelineEditor().placingCapturedAsset(
+        microphone,
+        at: microphone.captureStart ?? .zero,
+        in: withScreen.timeline,
+        assetDurations: durations
+    )
+
+    #expect(withMicrophone.timeline.tracks.map(\.kind) == [.screen, .microphone])
+    #expect(withMicrophone.timeline.tracks[0].clips[0].timelineStart == .zero)
+    #expect(
+        withMicrophone.timeline.tracks[1].clips[0].timelineStart
+            == StudioTime(microseconds: 15000)
+    )
+}
+
 @Test func extremePlaybackRateCannotTrapTimelineDuration() {
     let clip = TimelineClip(
         assetID: AssetID(),

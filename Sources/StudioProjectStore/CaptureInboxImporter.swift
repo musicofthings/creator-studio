@@ -247,9 +247,15 @@ public actor CaptureInboxImporter {
         if !validation.validated.isEmpty,
            existing.count == validation.validated.count,
            Set(existing.compactMap(\.contentHash)) == Set(validation.validated.map { "sha256:\($0.segment.sha256)" }) {
+            let workspace = try await repository.bootstrapCaptureAssets(
+                existing,
+                sessionID: id,
+                into: projectID,
+                now: now
+            )
             let acknowledged = acknowledgeImport(at: directory)
             return CaptureImportResult(
-                project: project,
+                project: workspace.project,
                 importedAssets: existing,
                 skipped: skipped,
                 wasRecovered: inboxItem.status != .completed,
@@ -312,16 +318,19 @@ public actor CaptureInboxImporter {
                 throw CaptureImportError.noRecoverableMedia(id)
             }
 
-            project.assets.removeAll { $0.captureSessionID == id }
-            project.assets.append(contentsOf: assets)
-            project.updatedAt = now
             try copyJournalIfPresent(
                 from: directory,
                 relativePath: manifest.eventsRelativePath,
                 to: packageURL,
                 sessionID: id
             )
-            try await repository.save(project)
+            let workspace = try await repository.bootstrapCaptureAssets(
+                assets,
+                sessionID: id,
+                into: projectID,
+                now: now
+            )
+            project = workspace.project
         } catch let error as CaptureImportError {
             for url in createdURLs { try? fileManager.removeItem(at: url) }
             throw error

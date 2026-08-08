@@ -19,6 +19,10 @@ import Testing
 
     let loaded = try await fixture.repository.load(id: project.id)
     #expect(loaded.assets == result.importedAssets)
+    let workspace = try await fixture.repository.loadWorkspace(id: project.id)
+    #expect(workspace.timeline.tracks.map(\.kind) == [.screen])
+    #expect(workspace.timeline.tracks[0].clips[0].assetID == result.importedAssets[0].id)
+    #expect(workspace.timeline.tracks[0].clips[0].timelineStart == .zero)
     let packageURL = await fixture.repository.packageURL(for: project.id)
     let copiedURL = packageURL.appendingPathComponent(try #require(loaded.assets.first).relativePath)
     let copiedBefore = try Data(contentsOf: copiedURL)
@@ -29,6 +33,44 @@ import Testing
 
     let discovered = await fixture.importer.discover()
     #expect(discovered.first(where: { $0.sessionID == session.id })?.status == .imported)
+}
+
+@Test func captureImportKeepsCrossSourceOffsetsOnInitialTracks() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let persistence = try fixture.persistence()
+
+    let segments: [(CaptureSource, String, StudioTime)] = [
+        (.screen, "screen-0000.mov", .zero),
+        (.appAudio, "app-audio-0000.m4a", StudioTime(microseconds: 8000)),
+        (.microphone, "microphone-0000.m4a", StudioTime(microseconds: 15000)),
+    ]
+    for (source, filename, start) in segments {
+        let data = Data("\(source.rawValue)-segment".utf8)
+        try data.write(to: persistence.directoryURL.appendingPathComponent("segments/\(filename)"))
+        try persistence.commit(CaptureSegment(
+            source: source,
+            relativePath: "segments/\(filename)",
+            sha256: fixture.sha256(data),
+            byteCount: Int64(data.count),
+            start: start,
+            duration: StudioTime(seconds: 2)
+        ))
+    }
+    try persistence.recordLifecycle(.finalized, state: .finalized)
+    let project = try await fixture.repository.create(title: "Synchronized", intent: .tutorial)
+
+    _ = try await fixture.importer.importSession(
+        id: persistence.manifest.sessionID,
+        into: project.id
+    )
+    let workspace = try await fixture.repository.loadWorkspace(id: project.id)
+
+    #expect(workspace.timeline.tracks.map(\.kind) == [.screen, .appAudio, .microphone])
+    #expect(workspace.timeline.tracks[0].clips[0].timelineStart == .zero)
+    #expect(workspace.timeline.tracks[1].clips[0].timelineStart == StudioTime(microseconds: 8000))
+    #expect(workspace.timeline.tracks[2].clips[0].timelineStart == StudioTime(microseconds: 15000))
+    #expect(workspace.editHistory.undoStack.isEmpty)
 }
 
 @Test func importsCommittedMediaAfterInjectedInterruption() async throws {

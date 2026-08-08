@@ -159,3 +159,53 @@ import Testing
     #expect(workspace.project.assets.isEmpty)
     #expect(workspace.timeline.tracks.isEmpty)
 }
+
+@Test func persistsInspectedMetadataAndUsesAnAssetScopedRebuildableCache() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("project-media-metadata-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let source = root.appendingPathComponent("portrait.mov")
+    try Data("immutable-placeholder".utf8).write(to: source)
+
+    let repository = FileProjectRepository(rootURL: root.appendingPathComponent("Projects"))
+    let project = try await repository.create(title: "Metadata", intent: .tutorial)
+    let imported = try await repository.importMedia(
+        from: source,
+        descriptor: MediaImportDescriptor(
+            kind: .screenVideo,
+            duration: StudioTime(seconds: 3)
+        ),
+        into: project.id
+    )
+    let metadata = SourceMediaMetadata(
+        naturalPixelSize: PixelSize(width: 1920, height: 1080),
+        preferredTransform: SourceAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0),
+        sourceStart: StudioTime(microseconds: -20000),
+        sourceDuration: StudioTime(seconds: 3),
+        nominalFrameRate: 30,
+        estimatedFrameRate: 29.97,
+        isVariableFrameRate: true,
+        audioFormat: SourceAudioFormat(sampleRate: 48000, channelCount: 2)
+    )
+
+    let updated = try await repository.updateMediaMetadata(
+        metadata,
+        displayPixelSize: PixelSize(width: 1080, height: 1920),
+        projectID: project.id,
+        assetID: imported.importedAsset.id
+    )
+    let location = try await repository.assetIngestLocation(
+        projectID: project.id,
+        assetID: imported.importedAsset.id
+    )
+
+    #expect(updated.project.assets[0].mediaMetadata == metadata)
+    #expect(updated.project.assets[0].pixelSize == PixelSize(width: 1080, height: 1920))
+    #expect(location.sourceURL == (try await repository.assetURL(
+        projectID: project.id,
+        assetID: imported.importedAsset.id
+    )))
+    #expect(location.cacheDirectoryURL.lastPathComponent == imported.importedAsset.id.description)
+    #expect(location.cacheDirectoryURL.deletingLastPathComponent().lastPathComponent == "cache")
+}
