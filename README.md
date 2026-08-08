@@ -8,6 +8,7 @@ This repository is a product-and-engineering bootstrap, not a finished editor. I
 - a PRD, TRD, architecture, API/data contracts, and phased roadmap;
 - a compiling Swift 6 package graph with domain, capture, storage, media, AI, and export boundaries;
 - an iOS application shell and a crash-recoverable ReplayKit broadcast capture foundation;
+- a native macOS application shell and ScreenCaptureKit capture foundation for user-selected windows, applications, and displays;
 - a navigable project workspace with immutable Files import, AVPlayer preview, and persisted non-destructive timeline editing;
 - an optional, self-hostable TypeScript AI gateway contract;
 - tests for the deterministic core.
@@ -28,18 +29,19 @@ make lint
 make test
 make demo
 make xcodeproj
+make macos-build
 ```
 
-Open `CreatorStudio.xcodeproj` for the iOS app and broadcast extension. The package can also be opened directly in Xcode.
+Open `CreatorStudio.xcodeproj` and choose the `CreatorStudio` scheme for iOS or `CreatorStudioMac` for macOS. The package can also be opened directly in Xcode.
 
-The app uses placeholder bundle identifiers. Change them in **one** place — `Configuration/identifiers.json` and `CaptureInboxLocation` — then run `make xcodeproj`, which regenerates the entitlements from that file. A drift between the two fails `swift test` rather than silently returning a nil App Group container at runtime. Set your team before device deployment.
+The apps use placeholder bundle identifiers. Change them in **one** place — `Configuration/identifiers.json` (and `CaptureInboxLocation` for the iOS App Group identifiers) — then run `make xcodeproj`, which regenerates the project and iOS entitlements from that file. A drift between the iOS values fails `swift test` rather than silently returning a nil App Group container at runtime. Set your team before device deployment.
 
-The Phase 0 capture foundation writes independent, bounded screen/app-audio/microphone segments into the App Group inbox, journals every committed segment, recovers interrupted sessions, and validates/hashes media before copying it into immutable project sources. Phase 1 now opens those projects, imports video/audio from Files, previews project-owned media, and supports persisted trim, split, reorder, disable, delete, and bounded undo/redo commands without modifying a source file. See [implementation status](docs/09-implementation-status.md) for the device qualification steps and remaining exit-gate work.
+The capture foundation writes independent, bounded screen/app-audio/microphone segments into a recovery inbox, journals every committed segment, recovers interrupted sessions, and validates/hashes media before copying it into immutable project sources. iOS uses the App Group inbox through its ReplayKit extension; macOS uses a sandbox-owned inbox through ScreenCaptureKit. Phase 1 opens those projects, imports video/audio, previews project-owned media, and supports persisted trim, split, reorder, disable, delete, and bounded undo/redo commands without modifying a source file. See [implementation status](docs/09-implementation-status.md) for the device qualification steps and remaining exit-gate work.
 
 ## Repository map
 
 ```text
-Apps/                     iOS app shell
+Apps/                     Native iOS and macOS app shells
 Configuration/            Bundle/App Group identifiers shared by Swift and the generator
 Extensions/               ReplayKit broadcast-upload extension shell
 Sources/                   Portable Swift package modules

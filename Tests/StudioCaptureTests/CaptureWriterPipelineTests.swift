@@ -163,6 +163,24 @@ import Testing
         #expect(harness.terminalStates.isEmpty)
     }
 
+    @Test func interruptedFinishCommitsOpenSegmentsAndRecordsRecoveryState() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
+
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.25), source: .appAudio)
+        harness.drain()
+
+        #expect(harness.pipeline.interruptSynchronously(
+            detail: "ScreenCaptureKit stream stopped unexpectedly.",
+            timeout: 30
+        ))
+        #expect(harness.persistence.manifest.state == .interrupted)
+        #expect(harness.persistence.manifest.files.count == 2)
+        #expect(harness.persistence.manifest.failureReason == "ScreenCaptureKit stream stopped unexpectedly.")
+        #expect(try harness.journalEvents(ofKind: .interrupted).count == 1)
+    }
+
     @Test func samplesArrivingAfterFinishAreIgnored() throws {
         let harness = try PipelineHarness()
         defer { harness.remove() }

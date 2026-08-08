@@ -86,6 +86,18 @@ Meet PRD launch readiness; no P0/P1 data-loss/privacy/accessibility issue; 100 c
 - iPad/Mac external drive and project handoff workflow.
 - Preset/template portability and Shortcuts actions.
 
+### macOS foundation implementation status — 8 August 2026
+
+- [x] Add a native SwiftUI macOS 15 target that reuses the portable domain, project-store, timeline, media, AI, and export package products.
+- [x] Add the ScreenCaptureKit system picker for a user-selected window, application, or display.
+- [x] Record screen, system/application audio, and microphone as separate bounded segments through the existing journaled capture pipeline.
+- [x] Preserve unexpected ScreenCaptureKit stops as interrupted, recoverable sessions rather than finalized recordings.
+- [x] Reuse the validated inbox importer to create immutable project sources and deterministic timeline tracks.
+- [x] Add a desktop project library, media import, source preview, and timeline overview.
+- [ ] Run a signed app with Screen Recording and microphone permissions; qualify real screen/system-audio/mic buffers, protected content, A/V offset/drift, and multi-display sizing.
+- [ ] Add editable pointer/click event metadata, keyboard callouts, dedicated camera capture, menu bar controls, and external-drive/project-handoff workflows.
+- [ ] Bring the full timeline command inspector and precision desktop editing interactions to the macOS UI.
+
 ### Exit gate
 
 macOS project round-trip without semantic change; cursor/focus workflow beats manual baseline; automatic clip precision@3 and acceptance meet product thresholds; no regression to local-first core.

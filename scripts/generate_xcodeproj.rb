@@ -15,6 +15,7 @@ IDENTIFIERS = JSON.parse(File.read(File.join(ROOT, "Configuration/identifiers.js
 APP_GROUP_ID = IDENTIFIERS.fetch("appGroupID")
 APP_BUNDLE_ID = IDENTIFIERS.fetch("appBundleID")
 BROADCAST_BUNDLE_ID = IDENTIFIERS.fetch("broadcastExtensionBundleID")
+MAC_APP_BUNDLE_ID = IDENTIFIERS.fetch("macAppBundleID")
 
 abort "Unexpected project path" unless File.basename(PROJECT_PATH) == "CreatorStudio.xcodeproj"
 FileUtils.rm_rf(PROJECT_PATH) if File.directory?(PROJECT_PATH)
@@ -49,6 +50,7 @@ project.root_object.attributes["LastUpgradeCheck"] = "2630"
 
 app = project.new_target(:application, "CreatorStudio", :ios, "18.0")
 broadcast = project.new_target(:app_extension, "CreatorBroadcast", :ios, "18.0")
+mac_app = project.new_target(:application, "CreatorStudioMac", :osx, "15.0")
 
 def configure_target(target, bundle_id, info_plist, entitlements, skip_install: false)
   target.build_configurations.each do |config|
@@ -83,6 +85,24 @@ configure_target(
   skip_install: true
 )
 
+mac_app.build_configurations.each do |config|
+  config.build_settings.merge!(
+    "PRODUCT_BUNDLE_IDENTIFIER" => MAC_APP_BUNDLE_ID,
+    "PRODUCT_NAME" => "$(TARGET_NAME)",
+    "MARKETING_VERSION" => "0.1.0",
+    "CURRENT_PROJECT_VERSION" => "1",
+    "SWIFT_VERSION" => "6.2",
+    "SWIFT_STRICT_CONCURRENCY" => "complete",
+    "ENABLE_USER_SCRIPT_SANDBOXING" => "YES",
+    "GENERATE_INFOPLIST_FILE" => "NO",
+    "INFOPLIST_FILE" => "Apps/CreatorStudioMac/Info.plist",
+    "CODE_SIGN_ENTITLEMENTS" => "Apps/CreatorStudioMac/CreatorStudioMac.entitlements",
+    "MACOSX_DEPLOYMENT_TARGET" => "15.0",
+    "ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS" => "YES",
+    "SKIP_INSTALL" => "NO"
+  )
+end
+
 app.build_configurations.each do |config|
   config.build_settings["TARGETED_DEVICE_FAMILY"] = "1,2"
   config.build_settings["ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS"] = "YES"
@@ -102,6 +122,15 @@ Dir.glob(File.join(ROOT, "Apps/CreatorStudioApp/Sources/*.swift")).sort.each do 
 end
 app_group.new_file("Info.plist")
 app_group.new_file("CreatorStudioApp.entitlements")
+
+mac_app_group = apps_group.new_group("CreatorStudioMac", "CreatorStudioMac")
+mac_app_sources = mac_app_group.new_group("Sources", "Sources")
+Dir.glob(File.join(ROOT, "Apps/CreatorStudioMac/Sources/*.swift")).sort.each do |path|
+  reference = mac_app_sources.new_file(File.basename(path))
+  mac_app.source_build_phase.add_file_reference(reference)
+end
+mac_app_group.new_file("Info.plist")
+mac_app_group.new_file("CreatorStudioMac.entitlements")
 
 extensions_group = project.main_group.new_group("Extensions", "Extensions")
 broadcast_group = extensions_group.new_group("CreatorBroadcast", "CreatorBroadcast")
@@ -125,14 +154,16 @@ project.root_object.package_references << package_reference
   StudioAI
   StudioExport
 ].each do |product_name|
-  dependency = project.new(Xcodeproj::Project::Object::XCSwiftPackageProductDependency)
-  dependency.package = package_reference
-  dependency.product_name = product_name
-  app.package_product_dependencies << dependency
+  [app, mac_app].each do |target|
+    dependency = project.new(Xcodeproj::Project::Object::XCSwiftPackageProductDependency)
+    dependency.package = package_reference
+    dependency.product_name = product_name
+    target.package_product_dependencies << dependency
 
-  build_file = project.new(Xcodeproj::Project::Object::PBXBuildFile)
-  build_file.product_ref = dependency
-  app.frameworks_build_phase.files << build_file
+    build_file = project.new(Xcodeproj::Project::Object::PBXBuildFile)
+    build_file.product_ref = dependency
+    target.frameworks_build_phase.files << build_file
+  end
 end
 
 %w[StudioDomain StudioCapture].each do |product_name|
@@ -159,5 +190,10 @@ scheme.add_build_target(app, true)
 scheme.add_build_target(broadcast, false)
 scheme.set_launch_target(app)
 scheme.save_as(PROJECT_PATH, "CreatorStudio", true)
+
+mac_scheme = Xcodeproj::XCScheme.new
+mac_scheme.add_build_target(mac_app, true)
+mac_scheme.set_launch_target(mac_app)
+mac_scheme.save_as(PROJECT_PATH, "CreatorStudioMac", true)
 
 puts "Generated #{PROJECT_PATH}"

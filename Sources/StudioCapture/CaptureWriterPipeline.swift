@@ -170,6 +170,34 @@ public final class CaptureWriterPipeline<Sample: Sendable>: @unchecked Sendable 
     /// or until `timeout` elapses. Returns `true` if the session finished in time.
     @discardableResult
     public func finishSynchronously(timeout: TimeInterval) -> Bool {
+        finishSynchronously(
+            timeout: timeout,
+            state: .finalized,
+            event: .finalized,
+            detail: nil
+        )
+    }
+
+    /// Stops accepting samples and preserves every segment that has already
+    /// reached its writer when a platform capture stream ends unexpectedly.
+    /// The resulting manifest stays distinguishable from a deliberate stop and
+    /// can be recovered by the same inbox importer.
+    @discardableResult
+    public func interruptSynchronously(detail: String, timeout: TimeInterval) -> Bool {
+        finishSynchronously(
+            timeout: timeout,
+            state: .interrupted,
+            event: .interrupted,
+            detail: detail
+        )
+    }
+
+    private func finishSynchronously(
+        timeout: TimeInterval,
+        state: CaptureManifestState,
+        event: CaptureJournalEventKind,
+        detail: String?
+    ) -> Bool {
         let waiter = DispatchSemaphore(value: 0)
         queue.async {
             if self.didFinish {
@@ -177,7 +205,12 @@ public final class CaptureWriterPipeline<Sample: Sendable>: @unchecked Sendable 
                 return
             }
             self.finishWaiters.append(waiter)
-            self.beginFinish(state: .finalized, event: .finalized, detail: nil, notifyHost: false)
+            self.beginFinish(
+                state: state,
+                event: event,
+                detail: detail,
+                notifyHost: false
+            )
         }
         return waiter.wait(timeout: .now() + timeout) == .success
     }

@@ -1,7 +1,17 @@
 # Implementation status
 
 **Updated:** 8 August 2026
-**Milestone:** Phase 0 capture foundation implemented; Phase 1 workspace and timeline-command slices implemented; physical-device qualification pending
+**Milestone:** iOS capture and Phase 1 workspace slices implemented; first native macOS capture/workspace slice implemented; runtime capture qualification pending
+
+## macOS desktop foundation vertical slice
+
+The repository now generates a native `CreatorStudioMac` target for macOS 15. Its `NavigationSplitView` desktop shell lists and creates projects through the same `FileProjectRepository`, opens the shared project/timeline schema, imports user-selected video and audio into immutable project storage, previews project-owned media, and renders a desktop timeline overview. The macOS target does not introduce a second project format or bypass the existing store.
+
+Screen recording starts only after the creator chooses a window, application, or display in the system ScreenCaptureKit picker. The adapter can include system/application audio and microphone audio, keeps those sources separate, renders the cursor and click indicator, excludes Creator Studio's own audio, and caps capture dimensions to an even, aspect-preserving 4K working size. The app is sandboxed, uses a sandbox-owned recovery inbox, and has no network dependency.
+
+ScreenCaptureKit sample buffers feed the same bounded `CaptureWriterPipeline` used by the ReplayKit foundation. Screen, application audio, and microphone are written as independent ten-second H.264/AAC segments. Every committed segment is hashed and journaled before the manifest replacement. A normal stop finalizes all open writers; an unexpected stream stop records an interrupted manifest and preserves every committed segment for the same path, hash, size, role, and immutable-copy validation used on iOS.
+
+Still pending on macOS: signed/runtime Screen Recording and microphone qualification; A/V sync, long-capture, protected-content, thermal, storage, and multi-display measurement; editable pointer paths and input-monitoring metadata; camera capture; menu bar controls; external-drive handoff; and the full precision timeline editor. An unsigned SDK build proves compilation and package integration but does not prove TCC permission behavior or real ScreenCaptureKit media delivery.
 
 ## Phase 1 project workspace vertical slice
 
@@ -37,6 +47,7 @@ The iOS preflight checks the requested capability set, App Group availability, m
 - `CaptureWriterPipeline` is covered directly with an injected fake writer: queue-full and backpressure drops, batched drop journaling, rotation at the segment boundary, writer failure as terminal with committed segments preserved, storage-reserve stop, unusable sample timing, observed-source recording, and finish ordering (waiters released only after every segment commits, repeat finishes are inert, post-finish samples ignored).
 - The Xcode project generator links only `StudioDomain` and `StudioCapture` into the broadcast extension; the extension does not gain project-store, media-analysis, AI, or export dependencies.
 - The app and embedded broadcast extension build for the generic iOS Simulator with code signing disabled.
+- The native macOS app builds against the macOS SDK with code signing disabled, including strict-concurrency checks across ScreenCaptureKit delegate and sample-output boundaries.
 - The optional AI gateway tests and TypeScript typecheck remain part of `make check`; capture introduces no gateway or cloud dependency.
 
 ## Signed physical-device verification required

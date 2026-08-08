@@ -1,4 +1,4 @@
-.PHONY: test demo format lint xcodeproj ios-build gateway-install gateway-check check
+.PHONY: test demo format lint xcodeproj ios-build macos-build gateway-install gateway-check check
 
 test:
 	swift test
@@ -18,10 +18,13 @@ xcodeproj:
 ios-build: xcodeproj
 	xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudio -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 
+macos-build: xcodeproj
+	xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudioMac -sdk macosx -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
+
 gateway-install:
 	npm --prefix services/ai-gateway install
 
 gateway-check:
 	npm --prefix services/ai-gateway run check
 
-check: lint test gateway-check ios-build
+check: lint test gateway-check ios-build macos-build

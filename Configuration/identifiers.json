@@ -1,5 +1,6 @@
 {
   "appGroupID": "group.com.example.CreatorStudio",
   "appBundleID": "com.example.CreatorStudio",
-  "broadcastExtensionBundleID": "com.example.CreatorStudio.Broadcast"
+  "broadcastExtensionBundleID": "com.example.CreatorStudio.Broadcast",
+  "macAppBundleID": "com.example.CreatorStudio.Mac"
 }

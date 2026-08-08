@@ -14,23 +14,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
-               BuildableName = "CreatorStudio.app"
-               BlueprintName = "CreatorStudio"
-               ReferencedContainer = "container:CreatorStudio.xcodeproj">
-            </BuildableReference>
-         </BuildActionEntry>
-         <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "NO"
-            buildForProfiling = "NO"
-            buildForArchiving = "NO"
-            buildForAnalyzing = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "925F8064721B1A2787718EF4"
-               BuildableName = "CreatorBroadcast.appex"
-               BlueprintName = "CreatorBroadcast"
+               BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+               BuildableName = "CreatorStudioMac.app"
+               BlueprintName = "CreatorStudioMac"
                ReferencedContainer = "container:CreatorStudio.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -44,9 +30,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
-            BuildableName = "CreatorStudio.app"
-            BlueprintName = "CreatorStudio"
+            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BuildableName = "CreatorStudioMac.app"
+            BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -67,9 +53,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
-            BuildableName = "CreatorStudio.app"
-            BlueprintName = "CreatorStudio"
+            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BuildableName = "CreatorStudioMac.app"
+            BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -84,9 +70,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "DFAA4D7212611B70D1BB0C3B"
-            BuildableName = "CreatorStudio.app"
-            BlueprintName = "CreatorStudio"
+            BlueprintIdentifier = "8100E2FE495188104CFCBC12"
+            BuildableName = "CreatorStudioMac.app"
+            BlueprintName = "CreatorStudioMac"
             ReferencedContainer = "container:CreatorStudio.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

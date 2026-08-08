@@ -74,6 +74,28 @@ import Testing
     #expect(withoutMicrophone.status == .ready)
 }
 
+@Test func desktopCaptureSizingPreservesAspectAndProducesEvenBoundedDimensions() {
+    let sizing = DesktopCaptureSizing()
+
+    #expect(sizing.dimensions(
+        pointWidth: 1728,
+        pointHeight: 1117,
+        pointPixelScale: 2
+    ) == CapturePixelDimensions(width: 3340, height: 2160))
+
+    #expect(sizing.dimensions(
+        pointWidth: 2560,
+        pointHeight: 1440,
+        pointPixelScale: 2
+    ) == CapturePixelDimensions(width: 3840, height: 2160))
+
+    #expect(sizing.dimensions(
+        pointWidth: 0,
+        pointHeight: 1080,
+        pointPixelScale: 2
+    ) == nil)
+}
+
 @Test func journalReplaysCommitMissingFromAtomicManifest() throws {
     let root = temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
