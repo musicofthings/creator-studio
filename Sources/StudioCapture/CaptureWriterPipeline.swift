@@ -212,7 +212,33 @@ public final class CaptureWriterPipeline<Sample: Sendable>: @unchecked Sendable 
                 notifyHost: false
             )
         }
-        return waiter.wait(timeout: .now() + timeout) == .success
+        let finishedInTime = waiter.wait(timeout: .now() + timeout) == .success
+        if !finishedInTime {
+            // Host gave up waiting. Reclassify a deliberate finalize as interrupted so
+            // discovery/recovery match on-disk state while writers may still close.
+            // The pipeline object remains alive via open finish callbacks.
+            queue.sync {
+                guard !self.didFinish else { return }
+                if self.requestedFinalState == .finalized {
+                    self.requestedFinalState = .interrupted
+                    self.requestedFinalEvent = .interrupted
+                }
+                let timeoutDetail =
+                    "Writers did not finish in time. Committed segments remain recoverable."
+                if let existing = self.terminalDetail, !existing.isEmpty {
+                    self.terminalDetail = "\(existing) \(timeoutDetail)"
+                } else {
+                    self.terminalDetail = timeoutDetail
+                }
+                try? self.persistence.recordLifecycle(
+                    .interrupted,
+                    state: .interrupted,
+                    duration: self.currentDuration(),
+                    detail: self.terminalDetail
+                )
+            }
+        }
+        return finishedInTime
     }
 
     private func process(_ sample: Sample, source: CaptureSource) {

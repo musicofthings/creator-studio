@@ -195,6 +195,30 @@ import Testing
         #expect(harness.persistence.manifest.files.count == 1)
         #expect(harness.persistence.manifest.state == .finalized)
     }
+
+    @Test func finishTimeoutReclassifiesAsInterruptedWhileWritersMayStillCommit() throws {
+        let harness = try PipelineHarness()
+        defer { harness.remove() }
+        // Finish after the host timeout so the waiter expires first.
+        harness.writers.finishDelay = 0.4
+
+        harness.pipeline.enqueue(FakeSample(seconds: 0), source: .screen)
+        harness.pipeline.enqueue(FakeSample(seconds: 0.1), source: .appAudio)
+        harness.drain()
+
+        #expect(!harness.pipeline.finishSynchronously(timeout: 0.05))
+        #expect(harness.persistence.manifest.state == .interrupted)
+        #expect(
+            harness.persistence.manifest.failureReason?
+                .contains("Writers did not finish in time") == true
+        )
+
+        // Slow writers still complete and commit under the reclassified state.
+        Thread.sleep(forTimeInterval: 0.6)
+        harness.drain()
+        #expect(harness.persistence.manifest.files.count == 2)
+        #expect(harness.persistence.manifest.state == .interrupted)
+    }
 }
 
 // MARK: - Harness

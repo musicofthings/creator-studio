@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Foundation
 
 enum MacPointerEventKind: String, Codable, Sendable {
@@ -17,11 +18,13 @@ struct MacPointerEvent: Codable, Sendable {
 /// Captures pointer context only while an opted-in screen recording is active.
 /// The sidecar stays in the same local capture session as the media and is used
 /// to create editable focus events after the recording is safely imported.
+///
+/// Event times are seconds since the first complete screen sample (the same
+/// origin used by capture segment `start` offsets), not since tracker init.
 final class MacPointerTracker: @unchecked Sendable {
     static let sidecarFilename = "cursor-events.jsonl"
 
     private let contentRect: CGRect
-    private let startedUptime: TimeInterval
     private let queue = DispatchQueue(
         label: "com.creatorstudio.macos.pointer-tracking",
         qos: .utility
@@ -30,6 +33,8 @@ final class MacPointerTracker: @unchecked Sendable {
     private var monitor: Any?
     private var lastMovement: MacPointerEvent?
     private var isStopped = false
+    /// Host uptime at the first complete screen sample; nil until media starts.
+    private var mediaClockOriginUptime: TimeInterval?
 
     init?(sessionDirectoryURL: URL, contentRect: CGRect) {
         guard contentRect.width > 0, contentRect.height > 0 else { return nil }
@@ -39,7 +44,6 @@ final class MacPointerTracker: @unchecked Sendable {
         else { return nil }
 
         self.contentRect = contentRect
-        startedUptime = ProcessInfo.processInfo.systemUptime
         self.fileHandle = fileHandle
     }
 
@@ -47,8 +51,38 @@ final class MacPointerTracker: @unchecked Sendable {
         stop()
     }
 
-    func start() {
-        guard monitor == nil else { return }
+    /// Whether macOS has granted Accessibility so global pointer monitors work.
+    static var isAccessibilityTrusted: Bool {
+        AXIsProcessTrusted()
+    }
+
+    /// Optionally presents the system Accessibility prompt, then returns trust state.
+    @discardableResult
+    static func requestAccessibilityTrust(prompt: Bool = true) -> Bool {
+        guard prompt else { return AXIsProcessTrusted() }
+        // Use the stable CFString value rather than the global `kAX…` symbol so
+        // this stays concurrency-safe under Swift 6 strict checking.
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+
+    static func openAccessibilitySettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+    }
+
+    /// Installs the global pointer monitor. Returns `false` when Accessibility is
+    /// denied and the monitor silently fails to install.
+    @discardableResult
+    func start() -> Bool {
+        guard monitor == nil else { return true }
         monitor = NSEvent.addGlobalMonitorForEvents(
             matching: [
                 .mouseMoved,
@@ -67,6 +101,15 @@ final class MacPointerTracker: @unchecked Sendable {
                 .movement
             }
             self?.record(point: NSEvent.mouseLocation, kind: kind)
+        }
+        return monitor != nil
+    }
+
+    /// Align pointer timestamps with the capture media clock (first screen sample).
+    func noteMediaClockOrigin(at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        queue.async { [weak self] in
+            guard let self, self.mediaClockOriginUptime == nil else { return }
+            self.mediaClockOriginUptime = uptime
         }
     }
 
@@ -104,15 +147,19 @@ final class MacPointerTracker: @unchecked Sendable {
               (-0.02 ... 1.02).contains(x), (-0.02 ... 1.02).contains(y)
         else { return }
 
-        let event = MacPointerEvent(
-            time: max(0, now - startedUptime),
-            x: min(max(x, 0), 1),
-            y: min(max(y, 0), 1),
-            kind: kind
-        )
         queue.async { [weak self] in
             guard let self else { return }
             guard !isStopped else { return }
+            // Drop events that arrive before the first media sample so focus
+            // markers cannot land with a different epoch than segment starts.
+            guard let origin = mediaClockOriginUptime else { return }
+
+            let event = MacPointerEvent(
+                time: max(0, now - origin),
+                x: min(max(x, 0), 1),
+                y: min(max(y, 0), 1),
+                kind: kind
+            )
             if kind == .movement,
                let previous = lastMovement,
                event.time - previous.time < 0.075,

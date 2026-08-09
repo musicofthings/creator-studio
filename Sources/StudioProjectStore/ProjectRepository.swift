@@ -710,6 +710,7 @@ public actor FileProjectRepository: ProjectRepository {
         }
 
         var timeline = original.timeline
+        var history = original.editHistory
         var durations = try assetDurations(in: original.project)
         for asset in sortedAssets {
             guard durations.updateValue(asset.duration, forKey: asset.id) == nil else {
@@ -717,18 +718,37 @@ public actor FileProjectRepository: ProjectRepository {
             }
         }
 
+        // A brand-new capture on an empty timeline stays "clean" (not undoable).
+        // Subsequent captures into an existing project must preserve prior undos
+        // and record each placement so history stays consistent with the timeline.
+        let preserveHistory = history.canUndo
+            || history.canRedo
+            || original.timeline.tracks.contains { !$0.clips.isEmpty }
+
         let timelineEnd = original.timeline.tracks
             .flatMap(\.clips)
             .map(\.timelineRange.end)
             .max() ?? .zero
         let sessionOrigin = sortedAssets.map { $0.captureStart ?? .zero }.min() ?? .zero
         for asset in sortedAssets {
-            timeline = try TimelineEditor().placingCapturedAsset(
+            let placement = try TimelineEditor().placingCapturedAsset(
                 asset,
                 at: timelineEnd + ((asset.captureStart ?? .zero) - sessionOrigin),
                 in: timeline,
                 assetDurations: durations
-            ).timeline
+            )
+            if preserveHistory {
+                try history.record(
+                    command: placement.command,
+                    before: timeline,
+                    after: placement.timeline
+                )
+            }
+            timeline = placement.timeline
+        }
+
+        if !preserveHistory {
+            history = TimelineEditHistory(timeline: timeline)
         }
 
         var project = original.project
@@ -737,7 +757,7 @@ public actor FileProjectRepository: ProjectRepository {
         let updated = ProjectWorkspace(
             project: project,
             timeline: timeline,
-            editHistory: TimelineEditHistory(timeline: timeline)
+            editHistory: history
         )
         try persist(updated, replacing: original)
         return updated

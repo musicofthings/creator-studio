@@ -148,6 +148,57 @@ import Testing
     ]))
 }
 
+@Test func reimportAfterSuccessfulBootstrapIsIdempotentBySessionAndDigest() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let session = try fixture.makeSession(state: .finalized)
+    let project = try await fixture.repository.create(title: "Idempotent", intent: .tutorial)
+
+    let first = try await fixture.importer.importSession(id: session.id, into: project.id)
+    #expect(first.importedAssets.count == 1)
+    #expect(first.inboxAcknowledged)
+
+    // Same session still on disk with matching digests: re-import must acknowledge
+    // without re-running bootstrap (which would throw "already present").
+    let second = try await fixture.importer.importSession(id: session.id, into: project.id)
+    #expect(second.importedAssets.map(\.id) == first.importedAssets.map(\.id))
+    #expect(second.importedAssets.map(\.contentHash) == first.importedAssets.map(\.contentHash))
+    #expect((try await fixture.repository.load(id: project.id)).assets.count == 1)
+}
+
+@Test func secondCaptureBootstrapPreservesPriorUndoHistory() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let first = try fixture.makeSession(state: .finalized)
+    let second = try fixture.makeSession(state: .finalized)
+    let unlisted = try await fixture.repository.create(title: "Unlisted Recordings", intent: .importOnly)
+
+    _ = try await fixture.importer.importSession(id: first.id, into: unlisted.id)
+    let afterFirst = try await fixture.repository.loadWorkspace(id: unlisted.id)
+    let firstClip = try #require(afterFirst.timeline.tracks.flatMap(\.clips).first)
+
+    let trimmed = try await fixture.repository.applyTimelineCommand(
+        .trim(
+            clipID: firstClip.id,
+            sourceRange: StudioTimeRange(start: .zero, duration: StudioTime(seconds: 1.5))
+        ),
+        to: unlisted.id
+    )
+    #expect(trimmed.editHistory.canUndo)
+    #expect(trimmed.editHistory.undoStack.count == 1)
+
+    _ = try await fixture.importer.importSession(id: second.id, into: unlisted.id)
+    let afterSecond = try await fixture.repository.loadWorkspace(id: unlisted.id)
+    #expect(afterSecond.project.assets.count == 2)
+    #expect(afterSecond.editHistory.canUndo)
+    // Prior trim remains; second-session placements are recorded on top.
+    #expect(afterSecond.editHistory.undoStack.count >= 2)
+    #expect(afterSecond.editHistory.undoStack.first?.command == trimmed.editHistory.undoStack.first?.command)
+
+    let undone = try await fixture.repository.undoTimelineEdit(projectID: unlisted.id)
+    #expect(undone.editHistory.canUndo)
+}
+
 @Test func discardingACompletedSessionRemovesOnlyTheRecoveryInboxCopy() async throws {
     let fixture = try CaptureImportFixture()
     defer { fixture.remove() }

@@ -257,18 +257,14 @@ public actor CaptureInboxImporter {
         var skipped = validation.skipped
         var project = try await repository.load(id: projectID)
         let existing = project.assets.filter { $0.captureSessionID == id }
+        // Idempotent re-import: bootstrap already placed these assets (e.g. process
+        // died before acknowledgeImport). Skip placement and only re-acknowledge.
         if !validation.validated.isEmpty,
            existing.count == validation.validated.count,
            Set(existing.compactMap(\.contentHash)) == Set(validation.validated.map { "sha256:\($0.segment.sha256)" }) {
-            let workspace = try await repository.bootstrapCaptureAssets(
-                existing,
-                sessionID: id,
-                into: projectID,
-                now: now
-            )
             let acknowledged = acknowledgeImport(at: directory)
             return CaptureImportResult(
-                project: workspace.project,
+                project: project,
                 importedAssets: existing,
                 skipped: skipped,
                 wasRecovered: inboxItem.status != .completed,

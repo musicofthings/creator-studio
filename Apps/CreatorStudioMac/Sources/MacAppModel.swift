@@ -55,6 +55,26 @@ struct MacAssetIngestStatus: Hashable, Sendable {
     }
 }
 
+/// Coalesces cache-generation progress callbacks before they hop to the main actor.
+private final class IngestProgressGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastStage: MediaCacheStage?
+    private var lastFraction = -1.0
+
+    func shouldPublish(_ progress: MediaCacheProgress) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let stageChanged = lastStage != progress.stage
+        let fractionAdvanced = progress.fractionCompleted - lastFraction >= 0.01
+        guard stageChanged || fractionAdvanced || progress.fractionCompleted >= 1 else {
+            return false
+        }
+        lastStage = progress.stage
+        lastFraction = progress.fractionCompleted
+        return true
+    }
+}
+
 /// Routes menu-bar and sidebar quick actions to the currently open project
 /// detail without coupling the app scene to view-local presentation state.
 enum MacProjectCommand: Equatable {
@@ -98,6 +118,8 @@ final class MacAppModel: ObservableObject {
     @Published var automaticFocusZoom = true
     @Published private(set) var captureState: CaptureState = .ready
     @Published private(set) var captureMessage = "Choose a window, application, or display when you are ready to record."
+    /// Non-fatal capture notices (Accessibility, hotkey registration, etc.).
+    @Published private(set) var captureNotice: String?
     @Published private(set) var captureInbox: [CaptureInboxItem] = []
     @Published private(set) var preflight: CapturePreflightReport?
     @Published private(set) var liveCaptureSources: Set<CaptureSource> = []
@@ -177,7 +199,7 @@ final class MacAppModel: ObservableObject {
 
     func enableCaptureShortcuts() {
         guard globalHotKeys == nil else { return }
-        globalHotKeys = MacGlobalHotKeyMonitor { [weak self] action in
+        let monitor = MacGlobalHotKeyMonitor { [weak self] action in
             guard let self else { return }
             switch action {
             case .toggleRecording:
@@ -186,6 +208,19 @@ final class MacAppModel: ObservableObject {
                 self.markFocusAtCurrentCursor()
             }
         }
+        globalHotKeys = monitor
+        if monitor.registrationFailed {
+            captureNotice =
+                "Global shortcuts (⌘⇧R / ⌘⇧F) could not be registered. Use the menu bar or capture controls instead."
+        }
+    }
+
+    func openAccessibilitySettings() {
+        MacPointerTracker.openAccessibilitySettings()
+    }
+
+    func dismissCaptureNotice() {
+        captureNotice = nil
     }
 
     func toggleCapture() async {
@@ -565,7 +600,9 @@ final class MacAppModel: ObservableObject {
             return
         }
         guard captureCoordinator.markFocusAtCurrentCursor() else {
-            errorMessage = "Pointer tracking is unavailable for this recording."
+            captureNotice = MacPointerTracker.isAccessibilityTrusted
+                ? "Pointer tracking is unavailable for this recording."
+                : "Pointer tracking needs Accessibility permission in System Settings before focus markers can be recorded."
             return
         }
         captureMessage = "Focus marker added at the current cursor position. Creator Studio will zoom there in the saved recording."
@@ -719,6 +756,8 @@ final class MacAppModel: ObservableObject {
             captureState = .failed
             captureMessage = message
             Task { await refresh() }
+        case let .notice(message):
+            captureNotice = message
         }
     }
 
@@ -828,18 +867,23 @@ final class MacAppModel: ObservableObject {
                     message: "Inspecting orientation and source timing",
                     result: nil
                 )
+                try Task.checkCancellation()
                 let location = try await self.repository.assetIngestLocation(
                     projectID: projectID,
                     assetID: asset.id
                 )
+                try Task.checkCancellation()
                 let inspection = try await AVAssetMediaInspector().inspect(location.sourceURL)
+                try Task.checkCancellation()
                 _ = try await self.repository.updateMediaMetadata(
                     inspection.metadata,
                     displayPixelSize: inspection.displayPixelSize,
                     projectID: projectID,
                     assetID: asset.id
                 )
+                try Task.checkCancellation()
                 let fingerprint = asset.contentHash ?? "asset:\(asset.id.description)"
+                let progressGate = IngestProgressGate()
                 let result = try await MediaCacheGenerator().generate(
                     sourceURL: location.sourceURL,
                     cacheDirectoryURL: location.cacheDirectoryURL,
@@ -847,6 +891,7 @@ final class MacAppModel: ObservableObject {
                     sourceContentHash: fingerprint,
                     inspection: inspection
                 ) { [weak self] progress in
+                    guard progressGate.shouldPublish(progress) else { return }
                     Task { @MainActor [weak self] in
                         guard let self,
                               self.ingestStatus[asset.id]?.isRunning == true
@@ -859,6 +904,7 @@ final class MacAppModel: ObservableObject {
                         )
                     }
                 }
+                try Task.checkCancellation()
                 self.ingestStatus[asset.id] = MacAssetIngestStatus(
                     phase: .complete,
                     fractionCompleted: 1,

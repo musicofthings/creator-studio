@@ -22,6 +22,8 @@ enum MacCaptureEvent: Sendable {
     case interrupted(String)
     case canceled
     case failed(String)
+    /// Non-fatal capture-side notice (permissions, degraded features).
+    case notice(String)
 }
 
 @MainActor
@@ -97,6 +99,8 @@ final class MacScreenCaptureCoordinator: NSObject {
         do {
             try await stream.stopCapture()
             sampleForwarder.clear()
+            // Hold the pipeline across the wait so finish callbacks can still
+            // commit segments after a host-side timeout.
             let finished = await Task.detached {
                 pipeline.finishSynchronously(timeout: 20)
             }.value
@@ -105,7 +109,8 @@ final class MacScreenCaptureCoordinator: NSObject {
             if finished, let sessionID {
                 onEvent(.stopped(sessionID))
             } else {
-                onEvent(.failed(
+                // Timed-out finalize is reclassified as interrupted on disk.
+                onEvent(.interrupted(
                     "The stream stopped, but one or more media writers did not finish in time. Committed segments remain recoverable."
                 ))
             }
@@ -205,11 +210,17 @@ final class MacScreenCaptureCoordinator: NSObject {
                 delegate: streamDelegate
             )
 
-            sampleForwarder.install(createdPipeline) { [weak self] source in
-                Task { @MainActor in
-                    self?.onEvent(.sourceObserved(source))
+            sampleForwarder.install(
+                createdPipeline,
+                sourceObserver: { [weak self] source in
+                    Task { @MainActor in
+                        self?.onEvent(.sourceObserved(source))
+                    }
+                },
+                firstScreenSample: { [weak tracker] in
+                    tracker?.noteMediaClockOrigin()
                 }
-            }
+            )
             try createdStream.addStreamOutput(
                 sampleForwarder,
                 type: .screen,
@@ -235,7 +246,16 @@ final class MacScreenCaptureCoordinator: NSObject {
             activeSessionID = createdPersistence.manifest.sessionID
             stream = createdStream
             isStopping = false
-            tracker?.start()
+            if let tracker {
+                if !MacPointerTracker.isAccessibilityTrusted {
+                    _ = MacPointerTracker.requestAccessibilityTrust(prompt: true)
+                }
+                if !tracker.start() {
+                    onEvent(.notice(
+                        "Pointer tracking needs Accessibility permission in System Settings. Recording continues without click or focus metadata."
+                    ))
+                }
+            }
             try await createdStream.startCapture()
             onEvent(.recording(createdPersistence.manifest.sessionID))
         } catch {
@@ -337,16 +357,21 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
     private let lock = NSLock()
     private var pipeline: CaptureWriterPipeline<MacCaptureSample>?
     private var sourceObserver: (@Sendable (CaptureSource) -> Void)?
+    private var firstScreenSample: (@Sendable () -> Void)?
     private var observedSources: Set<CaptureSource> = []
+    private var didNoteFirstScreenSample = false
 
     func install(
         _ pipeline: CaptureWriterPipeline<MacCaptureSample>,
-        sourceObserver: @escaping @Sendable (CaptureSource) -> Void
+        sourceObserver: @escaping @Sendable (CaptureSource) -> Void,
+        firstScreenSample: (@Sendable () -> Void)? = nil
     ) {
         lock.withLock {
             self.pipeline = pipeline
             self.sourceObserver = sourceObserver
+            self.firstScreenSample = firstScreenSample
             observedSources = []
+            didNoteFirstScreenSample = false
         }
     }
 
@@ -354,7 +379,9 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
         lock.withLock {
             pipeline = nil
             sourceObserver = nil
+            firstScreenSample = nil
             observedSources = []
+            didNoteFirstScreenSample = false
         }
     }
 
@@ -379,12 +406,21 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
         }
         let delivery = lock.withLock { () -> (
             CaptureWriterPipeline<MacCaptureSample>?,
-            (@Sendable (CaptureSource) -> Void)?
+            (@Sendable (CaptureSource) -> Void)?,
+            (@Sendable () -> Void)?
         ) in
             let observer = observedSources.insert(source).inserted ? sourceObserver : nil
-            return (pipeline, observer)
+            let mediaOrigin: (@Sendable () -> Void)?
+            if source == .screen, !didNoteFirstScreenSample {
+                didNoteFirstScreenSample = true
+                mediaOrigin = firstScreenSample
+            } else {
+                mediaOrigin = nil
+            }
+            return (pipeline, observer, mediaOrigin)
         }
         guard let pipeline = delivery.0 else { return }
+        delivery.2?()
         delivery.1?(source)
         pipeline.enqueue(MacCaptureSample(sampleBuffer), source: source)
     }

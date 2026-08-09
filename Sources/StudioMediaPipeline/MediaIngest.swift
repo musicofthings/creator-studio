@@ -59,9 +59,9 @@ public struct AVAssetMediaInspector: Sendable {
     public init() {}
 
     public func inspect(_ url: URL) async throws -> MediaInspectionResult {
-        try await Task.detached(priority: .userInitiated) {
-            try await Self.inspectInBackground(url)
-        }.value
+        // Stay on the caller's task tree so cancelIngest can interrupt inspection
+        // (Task.detached would keep reading after the outer task is cancelled).
+        try await Self.inspectInBackground(url)
     }
 
     private static func inspectInBackground(_ url: URL) async throws -> MediaInspectionResult {
@@ -536,6 +536,7 @@ public struct MediaCacheGenerator: Sendable {
             )
         }
 
+        var lastReportedFraction = -1.0
         while let sample = output.copyNextSampleBuffer() {
             try Task.checkCancellation()
             guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
@@ -563,10 +564,12 @@ public struct MediaCacheGenerator: Sendable {
 
             let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
             if timestamp.isFinite, inspection.duration.seconds > 0 {
-                progress(MediaCacheProgress(
-                    stage: .waveform,
-                    fractionCompleted: min(timestamp / inspection.duration.seconds, 0.98)
-                ))
+                let fraction = min(timestamp / inspection.duration.seconds, 0.98)
+                // Throttle: every ~1% (or first/last) avoids flooding the main actor.
+                if fraction - lastReportedFraction >= 0.01 || lastReportedFraction < 0 {
+                    lastReportedFraction = fraction
+                    progress(MediaCacheProgress(stage: .waveform, fractionCompleted: fraction))
+                }
             }
         }
         guard reader.status == .completed else {

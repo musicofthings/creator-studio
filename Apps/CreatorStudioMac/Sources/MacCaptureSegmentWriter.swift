@@ -158,6 +158,7 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
     func finish(completion: @escaping @Sendable (Result<CaptureSegment, Error>) -> Void) {
         input.markAsFinished()
         writer.finishWriting {
+            var movedToFinal = false
             do {
                 guard self.writer.status == .completed else {
                     throw MacCaptureWriterError.writerFailed(
@@ -168,6 +169,7 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
                     try FileManager.default.removeItem(at: self.finalURL)
                 }
                 try FileManager.default.moveItem(at: self.partialURL, to: self.finalURL)
+                movedToFinal = true
                 let values = try self.finalURL.resourceValues(forKeys: [.fileSizeKey])
                 let byteCount = Int64(values.fileSize ?? 0)
                 let digest = try Self.sha256(at: self.finalURL)
@@ -195,6 +197,11 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
                     duration: StudioTime(seconds: durationSeconds)
                 )))
             } catch {
+                // Leave only committed finals; scrub failed partials and invalid moves.
+                try? FileManager.default.removeItem(at: self.partialURL)
+                if movedToFinal {
+                    try? FileManager.default.removeItem(at: self.finalURL)
+                }
                 completion(.failure(error))
             }
         }

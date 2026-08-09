@@ -11,6 +11,7 @@ public enum TimelineEditError: Error, Equatable, Sendable {
     case invalidSourceRange(ClipID)
     case invalidSplit(ClipID)
     case invalidMoveIndex(Int)
+    case overlappingClips(ClipID, ClipID)
     case historyUnavailable
     case historyMismatch
 }
@@ -38,6 +39,8 @@ extension TimelineEditError: LocalizedError {
             "Choose a split point inside the clip."
         case .invalidMoveIndex:
             "The clip cannot be moved to that position."
+        case .overlappingClips:
+            "Clips on the same track cannot overlap. Place them adjacent or on separate tracks."
         case .historyUnavailable:
             "There is no timeline edit to restore."
         case .historyMismatch:
@@ -357,6 +360,12 @@ public struct TimelineEditor: Sendable {
                 trackIndex = timeline.tracks.count - 1
             }
             try Self.requireUnlocked(timeline.tracks[trackIndex])
+            let placedRange = clip.timelineRange
+            if let conflict = timeline.tracks[trackIndex].clips.first(where: {
+                $0.id != clip.id && placedRange.overlaps($0.timelineRange)
+            }) {
+                throw TimelineEditError.overlappingClips(clip.id, conflict.id)
+            }
             timeline.tracks[trackIndex].clips.append(clip)
             timeline.tracks[trackIndex].clips.sort {
                 if $0.timelineStart != $1.timelineStart { return $0.timelineStart < $1.timelineStart }

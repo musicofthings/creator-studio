@@ -258,13 +258,13 @@ struct MacSettingsView: View {
                     Divider().padding(.leading, 42)
                     settingsRow(
                         title: "Track pointer motion",
-                        detail: "Keep local pointer movement metadata for focus suggestions.",
+                        detail: "Keep local pointer movement metadata for focus suggestions. Requires Accessibility permission in System Settings.",
                         isOn: $model.trackMouseMovements
                     )
                     Divider().padding(.leading, 42)
                     settingsRow(
                         title: "Automatic focus zooms",
-                        detail: "Create calm, editable zooms around clicks and focus markers after saving.",
+                        detail: "Create calm, editable zooms around clicks and focus markers after saving. Uses pointer tracking (Accessibility).",
                         isOn: $model.automaticFocusZoom
                     )
                 }
@@ -363,6 +363,29 @@ private struct MacCaptureCard: View {
                 .font(.caption)
                 .foregroundStyle(statusMessageColor)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let notice = model.captureNotice {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        if notice.localizedCaseInsensitiveContains("Accessibility") {
+                            Button("Open Settings") {
+                                model.openAccessibilitySettings()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        Button("Dismiss") {
+                            model.dismissCaptureNotice()
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                    }
+                }
+            }
 
             Button {
                 Task {
@@ -1606,6 +1629,10 @@ private struct MacProjectDetailView: View {
         isExporting = true
         statusMessage = nil
         defer { isExporting = false }
+        let hasSecurityScope = outputURL.startAccessingSecurityScopedResource()
+        defer {
+            if hasSecurityScope { outputURL.stopAccessingSecurityScopedResource() }
+        }
         do {
             try await model.export(workspace: workspace, profile: profile, to: outputURL)
             statusMessage = "Exported \(profile.displayName) to \(outputURL.lastPathComponent)."

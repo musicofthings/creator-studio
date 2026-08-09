@@ -85,6 +85,57 @@ import Testing
     )
 }
 
+@Test func placeClipRejectsOverlappingRangesOnTheSameTrack() throws {
+    let projectID = ProjectID()
+    let timeline = TimelineDocument(id: TimelineID(), projectID: projectID)
+    let first = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/first.mov",
+        duration: StudioTime(seconds: 4),
+        captureStart: .zero
+    )
+    let overlapping = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/overlap.mov",
+        duration: StudioTime(seconds: 3),
+        captureStart: StudioTime(seconds: 2)
+    )
+    let abutting = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/next.mov",
+        duration: StudioTime(seconds: 2),
+        captureStart: StudioTime(seconds: 4)
+    )
+    let durations = [
+        first.id: first.duration,
+        overlapping.id: overlapping.duration,
+        abutting.id: abutting.duration,
+    ]
+
+    let placed = try TimelineEditor().placingCapturedAsset(
+        first,
+        at: .zero,
+        in: timeline,
+        assetDurations: durations
+    )
+    #expect(throws: TimelineEditError.self) {
+        _ = try TimelineEditor().placingCapturedAsset(
+            overlapping,
+            at: StudioTime(seconds: 2),
+            in: placed.timeline,
+            assetDurations: durations
+        )
+    }
+    let adjacent = try TimelineEditor().placingCapturedAsset(
+        abutting,
+        at: StudioTime(seconds: 4),
+        in: placed.timeline,
+        assetDurations: durations
+    )
+    #expect(adjacent.timeline.tracks[0].clips.count == 2)
+    #expect(adjacent.timeline.tracks[0].clips[1].timelineStart == StudioTime(seconds: 4))
+}
+
 @Test func focusEventsArePersistentUndoableTimelineEdits() throws {
     let timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID())
     let focus = FocusEvent(

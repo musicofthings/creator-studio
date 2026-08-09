@@ -15,6 +15,8 @@ final class MacGlobalHotKeyMonitor {
     private let actionHandler: (MacGlobalHotKeyAction) -> Void
     private var eventHandler: EventHandlerRef?
     private var hotKeys: [EventHotKeyRef?] = []
+    /// True when the event handler or either hot key failed to register.
+    private(set) var registrationFailed = false
 
     init(actionHandler: @escaping (MacGlobalHotKeyAction) -> Void) {
         self.actionHandler = actionHandler
@@ -48,10 +50,16 @@ final class MacGlobalHotKeyMonitor {
             userData,
             &eventHandler
         )
-        guard status == noErr else { return }
+        guard status == noErr else {
+            registrationFailed = true
+            return
+        }
 
         register(keyCode: UInt32(kVK_ANSI_R), action: .toggleRecording)
         register(keyCode: UInt32(kVK_ANSI_F), action: .markFocus)
+        if hotKeys.count < 2 {
+            registrationFailed = true
+        }
     }
 
     private func register(keyCode: UInt32, action: MacGlobalHotKeyAction) {
@@ -64,7 +72,10 @@ final class MacGlobalHotKeyMonitor {
             0,
             &hotKey
         )
-        guard status == noErr else { return }
+        guard status == noErr else {
+            registrationFailed = true
+            return
+        }
         hotKeys.append(hotKey)
     }
 
