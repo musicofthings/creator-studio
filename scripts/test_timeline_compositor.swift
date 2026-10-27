@@ -162,7 +162,9 @@ struct TimelineCompositorRegression {
         }
         writer.endSession(atSourceTime: time(4))
         input.markAsFinished()
-        await writer.finishWriting()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            writer.finishWriting { continuation.resume() }
+        }
         guard writer.status == .completed else { throw writer.error! }
     }
 }
