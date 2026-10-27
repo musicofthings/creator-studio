@@ -44,6 +44,14 @@ public struct NormalizedRect: Hashable, Codable, Sendable {
         let height = min(max(size.height, 0), 1 - y)
         return NormalizedRect(x: x, y: y, width: width, height: height)
     }
+
+    public var maxX: Double { origin.x + size.width }
+    public var maxY: Double { origin.y + size.height }
+
+    public func overlaps(_ other: NormalizedRect) -> Bool {
+        origin.x < other.maxX && other.origin.x < maxX
+            && origin.y < other.maxY && other.origin.y < maxY
+    }
 }
 
 public struct CanvasSpec: Hashable, Codable, Sendable {

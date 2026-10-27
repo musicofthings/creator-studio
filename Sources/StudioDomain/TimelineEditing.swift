@@ -69,6 +69,7 @@ public enum TimelineCommand: Hashable, Codable, Sendable {
     case move(clipID: ClipID, toIndex: Int)
     case delete(clipID: ClipID)
     case setEnabled(clipID: ClipID, isEnabled: Bool)
+    case setClipTransform(clipID: ClipID, transform: ClipTransform)
     case addFocusEvents([FocusEvent])
 }
 
@@ -215,7 +216,8 @@ public struct TimelineEditor: Sendable {
         _ asset: SourceAsset,
         at timelineStart: StudioTime,
         in timeline: TimelineDocument,
-        assetDurations: [AssetID: StudioTime] = [:]
+        assetDurations: [AssetID: StudioTime] = [:],
+        transform: ClipTransform = ClipTransform()
     ) throws -> TimelineAppendResult {
         guard asset.duration > .zero, timelineStart >= .zero else {
             throw TimelineEditError.invalidAssetDuration(asset.id)
@@ -234,7 +236,8 @@ public struct TimelineEditor: Sendable {
         let clip = TimelineClip(
             assetID: asset.id,
             sourceRange: StudioTimeRange(start: .zero, duration: asset.duration),
-            timelineStart: timelineStart
+            timelineStart: timelineStart,
+            transform: transform
         )
         let command = TimelineCommand.placeClip(
             trackID: track.id,
@@ -429,6 +432,26 @@ public struct TimelineEditor: Sendable {
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
             timeline.tracks[location.track].clips[location.clip].isEnabled = isEnabled
+
+        case let .setClipTransform(clipID, transform):
+            let location = try Self.location(of: clipID, in: timeline)
+            try Self.requireUnlocked(timeline.tracks[location.track])
+            guard transform.frame.isFinite,
+                  transform.frame.isPositive,
+                  transform.rotationDegrees.isFinite,
+                  transform.opacity.isFinite,
+                  (0 ... 1).contains(transform.opacity),
+                  transform.cornerRadius.isFinite,
+                  (0 ... 0.5).contains(transform.cornerRadius)
+            else {
+                throw TimelineEditError.invalidTimeline
+            }
+            timeline.tracks[location.track].clips[location.clip].transform = ClipTransform(
+                frame: transform.frame.clampedToFrame(),
+                rotationDegrees: transform.rotationDegrees,
+                opacity: transform.opacity,
+                cornerRadius: transform.cornerRadius
+            )
 
         case let .addFocusEvents(events):
             guard !events.isEmpty else { throw TimelineEditError.invalidTimeline }

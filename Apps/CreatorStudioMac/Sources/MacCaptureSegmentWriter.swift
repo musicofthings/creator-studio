@@ -36,9 +36,13 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
     private let input: AVAssetWriterInput
     private let partialURL: URL
     private let finalURL: URL
-    private let anchorSeconds: Double
+    /// Session host-uptime anchor shared across screen/camera/audio writers.
+    private let sessionAnchorSeconds: Double
+    /// Host uptime of this segment's first sample — used for session-relative start
+    /// and rotation so ScreenCaptureKit and AVCapture share one timeline.
+    private let segmentHostStartSeconds: Double
+    /// Media-clock start for encoding duration (sample buffer PTS).
     private let segmentStart: CMTime
-    private let segmentStartSeconds: Double
     private var lastPresentationTime: CMTime
     private var lastSampleDuration: CMTime = .zero
     private var appendedSamples = 0
@@ -48,7 +52,8 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
         index: Int,
         directoryURL: URL,
         firstSample: CMSampleBuffer,
-        anchorSeconds: Double
+        sessionAnchorSeconds: Double,
+        segmentHostStartSeconds: Double
     ) throws {
         guard let formatDescription = CMSampleBufferGetFormatDescription(firstSample) else {
             throw MacCaptureWriterError.invalidSample(source.rawValue)
@@ -59,30 +64,36 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
         }
 
         self.source = source
-        self.anchorSeconds = anchorSeconds
+        self.sessionAnchorSeconds = sessionAnchorSeconds
+        self.segmentHostStartSeconds = segmentHostStartSeconds.isFinite
+            ? segmentHostStartSeconds
+            : sessionAnchorSeconds
         segmentStart = presentationTime
-        segmentStartSeconds = CMTimeGetSeconds(presentationTime)
         lastPresentationTime = presentationTime
 
         let baseName = "\(Self.filePrefix(for: source))-\(String(format: "%04d", index))"
-        let fileExtension = source == .screen ? "mov" : "m4a"
+        let fileExtension = (source == .screen || source == .camera) ? "mov" : "m4a"
         let segments = directoryURL.appendingPathComponent("segments", isDirectory: true)
         partialURL = segments.appendingPathComponent("\(baseName).partial.\(fileExtension)")
         finalURL = segments.appendingPathComponent("\(baseName).\(fileExtension)")
         try? FileManager.default.removeItem(at: partialURL)
 
+        let isVideo = source == .screen || source == .camera
         writer = try AVAssetWriter(
             outputURL: partialURL,
-            fileType: source == .screen ? .mov : .m4a
+            fileType: isVideo ? .mov : .m4a
         )
         switch source {
-        case .screen:
+        case .screen, .camera:
             let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
             guard dimensions.width > 0, dimensions.height > 0 else {
                 throw MacCaptureWriterError.invalidSample(source.rawValue)
             }
             let pixels = Int64(dimensions.width) * Int64(dimensions.height)
-            let bitRate = min(24_000_000, max(4_000_000, pixels * 5))
+            // Facecam is typically smaller; keep bitrate proportional but capped.
+            let bitRate = source == .camera
+                ? min(8_000_000, max(1_500_000, pixels * 4))
+                : min(24_000_000, max(4_000_000, pixels * 5))
             input = AVAssetWriterInput(
                 mediaType: .video,
                 outputSettings: [
@@ -115,7 +126,7 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
                 ],
                 sourceFormatHint: description
             )
-        case .camera, .interactionEvents:
+        case .interactionEvents:
             throw MacCaptureWriterError.unsupportedSource(source.rawValue)
         }
 
@@ -133,7 +144,8 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
     }
 
     func shouldRotate(before presentationSeconds: Double, limit: TimeInterval) -> Bool {
-        appendedSamples > 0 && presentationSeconds - segmentStartSeconds >= limit
+        // Both axes are host uptime from the pipeline timing provider.
+        appendedSamples > 0 && presentationSeconds - segmentHostStartSeconds >= limit
     }
 
     func append(_ sample: MacCaptureSample) throws -> Bool {
@@ -173,7 +185,12 @@ final class MacCaptureSegmentWriter: CaptureSegmentWriting, @unchecked Sendable 
                 let values = try self.finalURL.resourceValues(forKeys: [.fileSizeKey])
                 let byteCount = Int64(values.fileSize ?? 0)
                 let digest = try Self.sha256(at: self.finalURL)
-                let relativeStartSeconds = max(0, self.segmentStartSeconds - self.anchorSeconds)
+                // Session placement uses host uptime so multi-segment and multi-source
+                // captures share one clock. Media PTS only measures this segment's duration.
+                let relativeStartSeconds = max(
+                    0,
+                    self.segmentHostStartSeconds - self.sessionAnchorSeconds
+                )
                 let durationSeconds = max(
                     0,
                     CMTimeGetSeconds(

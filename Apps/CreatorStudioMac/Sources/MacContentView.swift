@@ -320,6 +320,7 @@ struct MacSettingsView: View {
     private func settingsIcon(for title: String) -> String {
         switch title {
         case "Microphone": "mic"
+        case "Camera", "Camera (facecam)": "video"
         case "Show cursor": "cursorarrow"
         case "Highlight mouse clicks": "cursorarrow.click"
         case "Track pointer motion": "point.3.connected.trianglepath.dotted"
@@ -372,8 +373,15 @@ private struct MacCaptureCard: View {
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 8) {
                         if notice.localizedCaseInsensitiveContains("Accessibility") {
-                            Button("Open Settings") {
+                            Button("Open Accessibility Settings") {
                                 model.openAccessibilitySettings()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        if notice.localizedCaseInsensitiveContains("Camera") {
+                            Button("Open Camera Settings") {
+                                model.openCameraPrivacySettings()
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -413,6 +421,134 @@ private struct MacCaptureCard: View {
             .toggleStyle(.checkbox)
             .disabled(model.isRecording || model.captureIsBusy)
 
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Camera (facecam)", isOn: $model.includeCamera)
+                    .toggleStyle(.checkbox)
+                    .creatorHelp("Record a separate camera source alongside the screen, like Screen Studio or Loom. On Mac this is FaceTime, Continuity Camera, or a USB webcam — not front/back pairs.")
+                    .disabled(model.isRecording || model.captureIsBusy)
+                    .onChange(of: model.includeCamera) { _, enabled in
+                        if enabled { model.refreshCameras() }
+                    }
+
+                if model.includeCamera {
+                    if model.availableCameras.isEmpty {
+                        Text("No camera detected. Connect a webcam or enable Continuity Camera.")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Picker("Camera", selection: $model.selectedCameraID) {
+                            ForEach(model.availableCameras) { camera in
+                                Text(camera.displayName).tag(Optional(camera.id))
+                            }
+                        }
+                        .labelsHidden()
+                        .disabled(model.isRecording || model.captureIsBusy)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Layout")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Picker("Layout", selection: $model.captureLayout) {
+                            ForEach(CaptureLayout.dualSourceLayouts) { layout in
+                                Label(layout.displayName, systemImage: layout.systemImage)
+                                    .tag(layout)
+                            }
+                        }
+                        .labelsHidden()
+                        .disabled(model.isRecording || model.captureIsBusy)
+
+                        MacCaptureLayoutDiagram(
+                            layout: model.captureLayout,
+                            cameraFrameOverride: model.cameraBubbleFrameOverride
+                        )
+                        .frame(height: 72)
+                        .padding(6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.primary.opacity(0.04))
+                        )
+
+                        if model.cameraBubbleFrameOverride != nil {
+                            Button("Reset bubble position") {
+                                model.resetCameraBubbleOverride()
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.borderless)
+                        }
+                    }
+
+                    Text(MacCameraDevice.desktopAvailabilityNote)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if model.isRecording, model.includeCamera || model.isCameraLive {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(model.isCameraLive ? Color.red : Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text(model.isCameraLive
+                            ? "Live facecam (also on desktop)"
+                            : "Starting facecam…")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.black.opacity(0.82))
+                        VStack(spacing: 6) {
+                            Image(systemName: "rectangle.dashed")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.35))
+                            Text(
+                                model.isCameraLive
+                                    ? (model.liveCaptureSources.contains(.screen)
+                                        ? "Screen + live facecam"
+                                        : "Live camera")
+                                    : "Starting camera…"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.55))
+                        }
+                        MacCameraPreviewBubble(
+                            session: model.liveCameraSession,
+                            frame: model.liveCameraLayoutFrame,
+                            isCircle: model.liveCameraIsCircle,
+                            isDraggable: model.isCameraLive,
+                            onDragToCenter: { center in
+                                model.dragCameraBubble(toNormalizedCenter: center)
+                            }
+                        )
+                        .padding(10)
+                    }
+                    .frame(height: 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    Text("A floating bubble also stays on your desktop while recording. Drag it anywhere — it is hidden from the screen capture.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button {
+                Task { await model.beginCameraOnlyCapture() }
+            } label: {
+                Label("Record Camera Only", systemImage: "video")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.isRecording || model.captureIsBusy)
+            .creatorHelp("Podcast / talking-head mode: records the selected camera without a screen source.")
+
             if model.isRecording {
                 Button {
                     model.markFocusAtCurrentCursor()
@@ -442,6 +578,11 @@ private struct MacCaptureCard: View {
                         isActive: model.liveCaptureSources.contains(.screen)
                     )
                     captureSignal(
+                        "Cam",
+                        systemImage: "video.fill",
+                        isActive: model.liveCaptureSources.contains(.camera) || model.isCameraLive
+                    )
+                    captureSignal(
                         "System audio",
                         systemImage: "speaker.wave.2.fill",
                         isActive: model.liveCaptureSources.contains(.appAudio)
@@ -462,7 +603,7 @@ private struct MacCaptureCard: View {
                 ForEach(model.recoveryCaptures, id: \.sessionID) { item in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(item.status == .recovered ? "Recovered recording" : "Screen recording")
+                            Text(recoveryTitle(for: item))
                                 .font(.caption.weight(.medium))
                             Text("\(item.segmentCount) committed segment\(item.segmentCount == 1 ? "" : "s")")
                                 .font(.caption2)
@@ -510,6 +651,16 @@ private struct MacCaptureCard: View {
             }
         } message: {
             Text("This removes the unimported recording and all of its recovery files from this Mac.")
+        }
+    }
+
+    private func recoveryTitle(for item: CaptureInboxItem) -> String {
+        switch item.status {
+        case .completed: "Unsaved recording"
+        case .recovered: "Recovered recording"
+        case .storageConstrained: "Storage-stopped recording"
+        case .failed: "Failed recording"
+        default: "Screen recording"
         }
     }
 
@@ -876,6 +1027,13 @@ private struct MacProjectDetailView: View {
     @State private var statusMessage: String?
     @State private var splitSourceSeconds = 0.0
     @State private var workspaceTab: MacWorkspaceTab = .media
+    @State private var layoutPlayer: AVPlayer?
+    @State private var layoutScreenURL: URL?
+    @State private var layoutCameraURL: URL?
+    /// Capture session currently driving dual screen+camera preview.
+    @State private var previewCaptureSessionID: UUID?
+    /// When true, force single-source AVPlayer even if the session has dual video.
+    @State private var preferSingleSourcePreview = false
 
     var body: some View {
         Group {
@@ -1004,9 +1162,16 @@ private struct MacProjectDetailView: View {
         .task {
             await loadWorkspace()
             performPendingProjectCommand()
+            await revealPendingRecordingIfNeeded()
         }
         .onChange(of: model.projectCommand) { _, _ in
             performPendingProjectCommand()
+        }
+        .onChange(of: model.projectContentEpoch) { _, _ in
+            Task {
+                await loadWorkspace(selectingPreferred: false)
+                await revealPendingRecordingIfNeeded()
+            }
         }
         .onChange(of: model.ingestStatus) { previous, current in
             guard let projectAssets = workspace?.project.assets,
@@ -1028,7 +1193,10 @@ private struct MacProjectDetailView: View {
                 }
             }
         }
-        .onDisappear { player?.pause() }
+        .onDisappear {
+            player?.pause()
+            layoutPlayer?.pause()
+        }
     }
 
     private func projectView(_ workspace: ProjectWorkspace) -> some View {
@@ -1038,7 +1206,17 @@ private struct MacProjectDetailView: View {
                     GroupBox("Preview") {
                         ZStack {
                             Color.black
-                            if let player {
+                            if showsDualLayoutPreview(for: workspace),
+                               layoutScreenURL != nil || layoutCameraURL != nil {
+                                // Screen + facecam for the focused capture session only.
+                                MacLayoutPreviewView(
+                                    workspace: workspace,
+                                    model: model,
+                                    captureSessionID: previewCaptureSessionID,
+                                    player: $layoutPlayer
+                                )
+                                .onAppear { player?.pause() }
+                            } else if let player {
                                 MacNativePlayerView(player: player)
                             } else {
                                 ContentUnavailableView(
@@ -1050,18 +1228,93 @@ private struct MacProjectDetailView: View {
                         }
                         .frame(minHeight: 300)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                        if MacLayoutPreviewView.hasDualVideoLayout(
+                            workspace,
+                            captureSessionID: previewCaptureSessionID
+                        ) {
+                            HStack {
+                                Button(preferSingleSourcePreview ? "Show screen + bubble" : "Show selected source only") {
+                                    preferSingleSourcePreview.toggle()
+                                    Task {
+                                        if preferSingleSourcePreview {
+                                            if let id = selectedAssetID,
+                                               let asset = workspace.project.assets.first(where: { $0.id == id }) {
+                                                await select(asset)
+                                            }
+                                        } else {
+                                            await refreshLayoutPreviewURLs(
+                                                for: workspace,
+                                                sessionID: previewCaptureSessionID
+                                            )
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.borderless)
+                                .font(.caption)
+                                Spacer()
+                            }
+                            .padding(.top, 6)
+                        }
                     }
                     .frame(maxWidth: .infinity)
 
                     GroupBox("Project") {
-                        Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
-                            GridRow { Text("Intent"); Text(workspace.project.intent.rawValue.capitalized) }
-                            GridRow { Text("Sources"); Text("\(workspace.project.assets.count)") }
-                            GridRow { Text("Tracks"); Text("\(workspace.timeline.tracks.count)") }
-                            GridRow { Text("Revision"); Text("\(workspace.timeline.revision)") }
+                        VStack(alignment: .leading, spacing: 12) {
+                            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+                                GridRow { Text("Intent"); Text(workspace.project.intent.rawValue.capitalized) }
+                                GridRow { Text("Sources"); Text("\(workspace.project.assets.count)") }
+                                GridRow { Text("Tracks"); Text("\(workspace.timeline.tracks.count)") }
+                                GridRow { Text("Revision"); Text("\(workspace.timeline.revision)") }
+                            }
+                            .foregroundStyle(.secondary)
+
+                            if workspace.timeline.tracks.contains(where: {
+                                $0.kind == .camera && !$0.clips.isEmpty
+                            }) {
+                                Divider()
+                                Text("Camera layout")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Picker("Layout", selection: $model.captureLayout) {
+                                    ForEach(CaptureLayout.dualSourceLayouts) { layout in
+                                        Text(layout.displayName).tag(layout)
+                                    }
+                                }
+                                .labelsHidden()
+                                .disabled(isApplyingEdit)
+
+                                MacCaptureLayoutDiagram(
+                                    layout: model.captureLayout,
+                                    cameraFrameOverride: model.cameraBubbleFrameOverride
+                                )
+                                .frame(height: 64)
+
+                                HStack {
+                                    Button("Apply layout") {
+                                        Task { await applyProjectLayout(model.captureLayout) }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                    .disabled(isApplyingEdit)
+
+                                    if model.cameraBubbleFrameOverride != nil {
+                                        Button("Use dragged position") {
+                                            Task {
+                                                await applyProjectLayout(
+                                                    model.captureLayout,
+                                                    cameraFrame: model.cameraBubbleFrameOverride
+                                                )
+                                            }
+                                        }
+                                        .controlSize(.small)
+                                        .disabled(isApplyingEdit)
+                                    }
+                                }
+                                .creatorHelp("Repositions screen and camera clips without re-encoding sources. Undoable.")
+                            }
                         }
-                        .foregroundStyle(.secondary)
-                        .frame(minWidth: 190, alignment: .leading)
+                        .frame(minWidth: 210, alignment: .leading)
                     }
                 }
 
@@ -1526,13 +1779,44 @@ private struct MacProjectDetailView: View {
         }
     }
 
-    private func loadWorkspace() async {
+    private func loadWorkspace(selectingPreferred: Bool = true) async {
         isLoading = true
         do {
-            let loaded = try await model.loadWorkspace(id: projectID)
+            var loaded = try await model.loadWorkspace(id: projectID)
+            // Older dual-source imports stored camera full-frame. Promote to the
+            // default podcast bubble so facecam is visible over the screen.
+            let latestDualSession = Self.latestDualCaptureSession(in: loaded)
+            if let session = latestDualSession,
+               let camera = MacLayoutPreviewView.primaryClip(
+                   in: loaded, kind: .camera, captureSessionID: session
+               ),
+               camera.transform.frame == .fullFrame,
+               let screen = MacLayoutPreviewView.primaryClip(
+                   in: loaded, kind: .screen, captureSessionID: session
+               ),
+               screen.transform.frame == .fullFrame {
+                if let updated = try? await model.applyCaptureLayout(
+                    .screenWithCameraBubble,
+                    to: projectID
+                ) {
+                    loaded = updated
+                    statusMessage = "Applied Screen + Bubble layout so facecam is visible over the screen."
+                }
+            }
             workspace = loaded
-            if let first = loaded.project.assets.first {
-                await select(first)
+            if selectingPreferred {
+                let focusSession = latestDualSession
+                    ?? loaded.project.assets.last?.captureSessionID
+                previewCaptureSessionID = focusSession
+                preferSingleSourcePreview = false
+                await refreshLayoutPreviewURLs(for: loaded, sessionID: focusSession)
+                if let preferred = Self.preferredAsset(in: loaded, sessionID: focusSession) {
+                    await select(preferred, preferDualIfAvailable: true)
+                } else if let first = loaded.project.assets.first {
+                    await select(first, preferDualIfAvailable: true)
+                }
+            } else {
+                await refreshLayoutPreviewURLs(for: loaded, sessionID: previewCaptureSessionID)
             }
         } catch {
             workspace = nil
@@ -1541,12 +1825,112 @@ private struct MacProjectDetailView: View {
         isLoading = false
     }
 
+    private func revealPendingRecordingIfNeeded() async {
+        guard let reveal = model.takePendingRecordingReveal(for: projectID) else { return }
+        let loaded: ProjectWorkspace? = if let workspace {
+            workspace
+        } else {
+            try? await model.loadWorkspace(id: projectID)
+        }
+        guard let current = loaded else {
+            return
+        }
+        workspace = current
+        previewCaptureSessionID = reveal.captureSessionID
+        preferSingleSourcePreview = false
+        await refreshLayoutPreviewURLs(for: current, sessionID: reveal.captureSessionID)
+        if let preferredID = reveal.preferredAssetID,
+           let asset = current.project.assets.first(where: { $0.id == preferredID }) {
+            await select(asset, preferDualIfAvailable: true)
+            statusMessage = "Opened your new recording."
+        } else if let preferred = Self.preferredAsset(in: current, sessionID: reveal.captureSessionID) {
+            await select(preferred, preferDualIfAvailable: true)
+            statusMessage = "Opened your new recording."
+        }
+        workspaceTab = .media
+    }
+
+    private func showsDualLayoutPreview(for workspace: ProjectWorkspace) -> Bool {
+        !preferSingleSourcePreview
+            && MacLayoutPreviewView.hasDualVideoLayout(
+                workspace,
+                captureSessionID: previewCaptureSessionID
+            )
+            && (layoutScreenURL != nil || layoutCameraURL != nil)
+    }
+
+    private func refreshLayoutPreviewURLs(
+        for workspace: ProjectWorkspace,
+        sessionID: UUID?
+    ) async {
+        layoutScreenURL = await urlForPrimaryClip(
+            kind: .screen,
+            in: workspace,
+            sessionID: sessionID
+        )
+        layoutCameraURL = await urlForPrimaryClip(
+            kind: .camera,
+            in: workspace,
+            sessionID: sessionID
+        )
+    }
+
+    private func urlForPrimaryClip(
+        kind: TrackKind,
+        in workspace: ProjectWorkspace,
+        sessionID: UUID?
+    ) async -> URL? {
+        guard let clip = MacLayoutPreviewView.primaryClip(
+            in: workspace,
+            kind: kind,
+            captureSessionID: sessionID
+        ),
+            let asset = workspace.project.assets.first(where: { $0.id == clip.assetID })
+        else { return nil }
+        return try? await model.previewURL(projectID: projectID, assetID: asset.id)
+    }
+
+    private static func latestDualCaptureSession(in workspace: ProjectWorkspace) -> UUID? {
+        let sessionIDs = Set(workspace.project.assets.compactMap(\.captureSessionID))
+        return sessionIDs
+            .filter { MacLayoutPreviewView.hasDualVideoLayout(workspace, captureSessionID: $0) }
+            .compactMap { session -> (UUID, Date)? in
+                let created = workspace.project.assets
+                    .filter { $0.captureSessionID == session }
+                    .map(\.createdAt)
+                    .max()
+                guard let created else { return nil }
+                return (session, created)
+            }
+            .max(by: { $0.1 < $1.1 })?
+            .0
+    }
+
+    private static func preferredAsset(
+        in workspace: ProjectWorkspace,
+        sessionID: UUID?
+    ) -> SourceAsset? {
+        let assets: [SourceAsset] = if let sessionID {
+            workspace.project.assets.filter { $0.captureSessionID == sessionID }
+        } else {
+            workspace.project.assets
+        }
+        return assets.first(where: { $0.kind == .screenVideo })
+            ?? assets.first(where: { $0.kind == .cameraVideo })
+            ?? assets.first
+    }
+
+    private func previewURL(for kind: TrackKind, in workspace: ProjectWorkspace) -> URL? {
+        kind == .screen ? layoutScreenURL : layoutCameraURL
+    }
+
     @MainActor
     private func performPendingProjectCommand() {
         guard let workspace,
               let command = model.takeProjectCommand(for: projectID)
         else { return }
 
+        let playbackPlayer = showsDualLayoutPreview(for: workspace) ? layoutPlayer : player
         switch command {
         case .importMedia:
             isPresentingImporter = true
@@ -1565,7 +1949,7 @@ private struct MacProjectDetailView: View {
         case .showEditor:
             workspaceTab = .editor
         case .togglePlayback:
-            if let player {
+            if let player = playbackPlayer {
                 if player.timeControlStatus == .playing {
                     player.pause()
                 } else {
@@ -1575,7 +1959,7 @@ private struct MacProjectDetailView: View {
                 Task { await select(firstAsset) }
             }
         case let .stepPlayback(_, count):
-            player?.currentItem?.step(byCount: count)
+            playbackPlayer?.currentItem?.step(byCount: count)
         }
     }
 
@@ -1588,6 +1972,29 @@ private struct MacProjectDetailView: View {
         do {
             try await model.clearRebuildableCache(for: workspace)
             statusMessage = "Cleared local proxies and waveforms. Source recordings are unchanged."
+        } catch {
+            model.errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func applyProjectLayout(
+        _ layout: CaptureLayoutID,
+        cameraFrame: NormalizedRect? = nil
+    ) async {
+        guard !isApplyingEdit else { return }
+        isApplyingEdit = true
+        statusMessage = nil
+        defer { isApplyingEdit = false }
+        do {
+            let updated = try await model.applyCaptureLayout(
+                layout,
+                to: projectID,
+                cameraFrameOverride: cameraFrame
+            )
+            workspace = updated
+            await refreshLayoutPreviewURLs(for: updated, sessionID: previewCaptureSessionID)
+            statusMessage = "Applied \(layout.displayName) layout to screen and camera clips."
         } catch {
             model.errorMessage = error.localizedDescription
         }
@@ -1701,11 +2108,36 @@ private struct MacProjectDetailView: View {
         )
     }
 
-    private func select(_ asset: SourceAsset, clip: TimelineClip? = nil) async {
+    private func select(
+        _ asset: SourceAsset,
+        clip: TimelineClip? = nil,
+        preferDualIfAvailable: Bool = false
+    ) async {
         do {
             if let workspace {
                 model.ensureIngest(for: workspace, assets: [asset])
             }
+            // Keep dual layout when browsing within a dual-source session unless
+            // the user asked for single-source playback.
+            if let session = asset.captureSessionID {
+                previewCaptureSessionID = session
+                if preferDualIfAvailable {
+                    preferSingleSourcePreview = false
+                } else if let workspace,
+                          MacLayoutPreviewView.hasDualVideoLayout(
+                              workspace,
+                              captureSessionID: session
+                          ) {
+                    // Manual source pick → show that source alone so files are always playable.
+                    preferSingleSourcePreview = true
+                }
+            } else {
+                preferSingleSourcePreview = true
+            }
+            if let workspace {
+                await refreshLayoutPreviewURLs(for: workspace, sessionID: previewCaptureSessionID)
+            }
+
             let url = try await model.previewURL(projectID: projectID, assetID: asset.id)
             player?.pause()
             selectedAssetID = asset.id
@@ -1722,6 +2154,12 @@ private struct MacProjectDetailView: View {
                 }
             }
             player = selectedPlayer
+            // Only the visible preview owns playback and audio.
+            if let workspace, showsDualLayoutPreview(for: workspace) {
+                selectedPlayer.pause()
+            } else {
+                selectedPlayer.play()
+            }
         } catch {
             model.errorMessage = error.localizedDescription
         }

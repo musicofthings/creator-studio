@@ -682,6 +682,8 @@ public actor FileProjectRepository: ProjectRepository {
         _ assets: [SourceAsset],
         sessionID: UUID,
         into projectID: ProjectID,
+        layout: CaptureLayoutID = .default,
+        cameraFrameOverride: NormalizedRect? = nil,
         now: Date = .studioNow()
     ) async throws -> ProjectWorkspace {
         guard !assets.isEmpty,
@@ -730,12 +732,26 @@ public actor FileProjectRepository: ProjectRepository {
             .map(\.timelineRange.end)
             .max() ?? .zero
         let sessionOrigin = sortedAssets.map { $0.captureStart ?? .zero }.min() ?? .zero
+        let hasScreen = sortedAssets.contains { $0.kind == .screenVideo }
+        let hasCamera = sortedAssets.contains { $0.kind == .cameraVideo }
+        let resolvedLayout: CaptureLayoutID = {
+            if hasScreen, hasCamera { return layout }
+            if hasCamera, !hasScreen { return .cameraOnly }
+            if hasScreen, !hasCamera { return .screenOnly }
+            return layout
+        }()
+
         for asset in sortedAssets {
             let placement = try TimelineEditor().placingCapturedAsset(
                 asset,
                 at: timelineEnd + ((asset.captureStart ?? .zero) - sessionOrigin),
                 in: timeline,
-                assetDurations: durations
+                assetDurations: durations,
+                transform: CaptureLayout.transform(
+                    for: asset.kind,
+                    layout: resolvedLayout,
+                    cameraFrameOverride: cameraFrameOverride
+                )
             )
             if preserveHistory {
                 try history.record(
@@ -759,6 +775,58 @@ public actor FileProjectRepository: ProjectRepository {
             timeline: timeline,
             editHistory: history
         )
+        try persist(updated, replacing: original)
+        return updated
+    }
+
+    /// Re-applies a capture layout to existing screen/camera clips (non-destructive).
+    /// When `cameraFrameOverride` is set, the camera bubble/pane is positioned there.
+    public func applyCaptureLayout(
+        _ layout: CaptureLayoutID,
+        to projectID: ProjectID,
+        cameraFrameOverride: NormalizedRect? = nil,
+        now: Date = .studioNow()
+    ) async throws -> ProjectWorkspace {
+        let original = try await loadWorkspace(id: projectID)
+        let hasScreen = original.timeline.tracks.contains { $0.kind == .screen && !$0.clips.isEmpty }
+        let hasCamera = original.timeline.tracks.contains { $0.kind == .camera && !$0.clips.isEmpty }
+        let resolved: CaptureLayoutID = {
+            if hasScreen, hasCamera { return layout }
+            if hasCamera, !hasScreen { return .cameraOnly }
+            if hasScreen, !hasCamera { return .screenOnly }
+            return layout
+        }()
+
+        var timeline = original.timeline
+        var history = original.editHistory
+        let durations = try assetDurations(in: original.project)
+
+        for trackIndex in timeline.tracks.indices {
+            let kind = timeline.tracks[trackIndex].kind
+            guard kind == .screen || kind == .camera else { continue }
+            for clipIndex in timeline.tracks[trackIndex].clips.indices {
+                let clip = timeline.tracks[trackIndex].clips[clipIndex]
+                let mediaKind: MediaKind = kind == .screen ? .screenVideo : .cameraVideo
+                let next = CaptureLayout.transform(
+                    for: mediaKind,
+                    layout: resolved,
+                    cameraFrameOverride: kind == .camera ? cameraFrameOverride : nil
+                )
+                guard next != clip.transform else { continue }
+                let command = TimelineCommand.setClipTransform(clipID: clip.id, transform: next)
+                let before = timeline
+                timeline = try TimelineEditor().applying(
+                    command,
+                    to: timeline,
+                    assetDurations: durations
+                )
+                try history.record(command: command, before: before, after: timeline)
+            }
+        }
+
+        var project = original.project
+        project.updatedAt = now
+        let updated = ProjectWorkspace(project: project, timeline: timeline, editHistory: history)
         try persist(updated, replacing: original)
         return updated
     }

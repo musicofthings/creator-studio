@@ -111,8 +111,14 @@ extension CaptureImportError: LocalizedError {
             "A capture file failed validation and was not imported."
         case .hashMismatch:
             "A capture file changed after it was committed and was not imported."
-        case .copyFailed:
-            "Creator Studio could not safely copy the capture into the project."
+        case .copyFailed(let detail):
+            if detail.isEmpty {
+                "Creator Studio could not safely copy the capture into the project."
+            } else if detail.hasPrefix("Creator Studio could not") {
+                detail
+            } else {
+                "Creator Studio could not safely copy the capture into the project. \(detail)"
+            }
         }
     }
 }
@@ -223,6 +229,8 @@ public actor CaptureInboxImporter {
         id: UUID,
         into projectID: ProjectID,
         recordingName: String? = nil,
+        layout: CaptureLayoutID = .default,
+        cameraFrameOverride: NormalizedRect? = nil,
         now: Date = .studioNow()
     ) async throws -> CaptureImportResult {
         let directory = inboxRootURL.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
@@ -327,6 +335,12 @@ public actor CaptureInboxImporter {
                 ))
             }
 
+            // Multi-segment sessions that accidentally recorded every startUs as 0
+            // (host/media clock mix) would all place at the same timeline origin and
+            // fail with overlappingClips. Repair by chaining same-kind segments in
+            // filename order so already-finalized inbox sessions still import.
+            assets = Self.repairedCaptureStarts(assets)
+
             guard !assets.isEmpty else {
                 throw CaptureImportError.noRecoverableMedia(id)
             }
@@ -346,6 +360,8 @@ public actor CaptureInboxImporter {
                 assets,
                 sessionID: id,
                 into: projectID,
+                layout: layout,
+                cameraFrameOverride: cameraFrameOverride,
                 now: now
             )
             project = workspace.project
@@ -676,5 +692,33 @@ public actor CaptureInboxImporter {
         case .camera: .cameraVideo
         case .interactionEvents: .overlay
         }
+    }
+
+    /// When several assets of the same kind share one captureStart (typically all
+    /// zero from a writer clock bug), assign sequential starts by cumulative
+    /// duration so they place as adjacent timeline clips instead of overlapping.
+    static func repairedCaptureStarts(_ assets: [SourceAsset]) -> [SourceAsset] {
+        guard assets.count > 1 else { return assets }
+
+        var result = assets
+        let kinds = Set(assets.map(\.kind))
+        for kind in kinds {
+            let indices = result.indices.filter { result[$0].kind == kind }
+            guard indices.count > 1 else { continue }
+            let starts = Set(indices.map { result[$0].captureStart ?? .zero })
+            guard starts.count == 1 else { continue }
+
+            let ordered = indices.sorted {
+                let left = result[$0].originalFilename ?? result[$0].relativePath
+                let right = result[$1].originalFilename ?? result[$1].relativePath
+                return left.localizedStandardCompare(right) == .orderedAscending
+            }
+            var cursor = starts.first ?? .zero
+            for index in ordered {
+                result[index].captureStart = cursor
+                cursor = cursor + result[index].duration
+            }
+        }
+        return result
     }
 }

@@ -97,7 +97,8 @@ Meet PRD launch readiness; no P0/P1 data-loss/privacy/accessibility issue; 100 c
 - [x] Inspect and persist orientation, presentation-time, variable-frame-rate, and audio-format metadata without transcoding source media.
 - [x] Generate cancellable, content-keyed editing proxies and waveform caches with progress, retry, and relaunch reuse in the macOS workspace.
 - [ ] Run a signed app with Screen Recording and microphone permissions; qualify real screen/system-audio/mic buffers, protected content, A/V offset/drift, and multi-display sizing.
-- [ ] Add editable pointer/click event metadata, keyboard callouts, dedicated camera capture, menu bar controls, and external-drive/project-handoff workflows.
+- [x] Add dedicated camera capture (facecam with screen, or camera-only) via AVFoundation into the journaled capture pipeline.
+- [ ] Add editable pointer/click event metadata depth, keyboard callouts, Continuity-camera polish, camera+mic without screen, menu bar controls, and external-drive/project-handoff workflows.
 - [ ] Bring the full timeline command inspector and precision desktop editing interactions to the macOS UI.
 
 ### Exit gate

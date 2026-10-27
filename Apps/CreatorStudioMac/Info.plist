@@ -24,6 +24,10 @@
     <string>public.app-category.video</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Creator Studio records microphone audio only when you include it in a screen recording.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Creator Studio records your camera as a separate facecam or camera-only source when you turn camera capture on. On Mac this is the built-in FaceTime camera, Continuity Camera, or a connected webcam.</string>
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

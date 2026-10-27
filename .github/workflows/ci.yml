@@ -52,6 +52,10 @@ jobs:
             xcodebuild -downloadPlatform iOS
           fi
           xcrun simctl list runtimes
+      - name: Render compositor regressions
+        run: bash scripts/test_timeline_compositor.sh
+      - name: Build macOS app
+        run: xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudioMac -sdk macosx -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
       - name: Build iOS shell
         run: xcodebuild -project CreatorStudio.xcodeproj -scheme CreatorStudio -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 

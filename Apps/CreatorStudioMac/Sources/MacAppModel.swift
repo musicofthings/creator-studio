@@ -101,6 +101,13 @@ enum MacProjectCommand: Equatable {
     }
 }
 
+/// After a capture is saved, open the project and select the new media for preview.
+struct MacRecordingReveal: Equatable, Sendable {
+    var projectID: ProjectID
+    var captureSessionID: UUID?
+    var preferredAssetID: AssetID?
+}
+
 @MainActor
 final class MacAppModel: ObservableObject {
     @Published private(set) var projects: [ProjectSummary] = []
@@ -109,13 +116,27 @@ final class MacAppModel: ObservableObject {
     @Published var isPresentingNewProject = false
     @Published private(set) var isWorking = false
     @Published private(set) var projectCommand: MacProjectCommand?
+    /// Bumped whenever a capture is imported so an already-open project reloads.
+    @Published private(set) var projectContentEpoch: UInt64 = 0
+    /// Latest capture save to reveal in the project detail preview.
+    @Published private(set) var pendingRecordingReveal: MacRecordingReveal?
 
     @Published var includeSystemAudio = true
     @Published var includeMicrophone = false
+    /// Loom / Screen Studio-style facecam alongside screen (or camera-only mode).
+    @Published var includeCamera = true
+    @Published var selectedCameraID: String?
+    /// How screen + camera are composed on the canvas (bubble, split, etc.).
+    @Published var captureLayout: CaptureLayoutID = .default
+    /// Live drag override for the facecam bubble (top-left normalized). Nil = layout default.
+    @Published var cameraBubbleFrameOverride: NormalizedRect?
+    /// True while the AVCapture camera session is running (drives live bubble UI).
+    @Published private(set) var isCameraLive = false
     @Published var showCursor = true
     @Published var highlightMouseClicks = true
     @Published var trackMouseMovements = true
     @Published var automaticFocusZoom = true
+    @Published private(set) var availableCameras: [MacCameraDevice] = []
     @Published private(set) var captureState: CaptureState = .ready
     @Published private(set) var captureMessage = "Choose a window, application, or display when you are ready to record."
     /// Non-fatal capture notices (Accessibility, hotkey registration, etc.).
@@ -146,6 +167,8 @@ final class MacAppModel: ObservableObject {
     private var pendingIngest: [PendingIngest] = []
     private var activeIngestAssetID: AssetID?
     private var globalHotKeys: MacGlobalHotKeyMonitor?
+    /// Desktop always-on-top facecam bubble while the camera is live.
+    private let floatingCameraBubble = MacFloatingCameraBubbleController()
 
     init() {
         let fileManager = FileManager.default
@@ -169,9 +192,70 @@ final class MacAppModel: ObservableObject {
             repository: repository
         )
         captureWatcher = CaptureInboxWatcher(url: captureInboxRoot)
+        availableCameras = MacCameraDiscovery.devices()
+        selectedCameraID = MacCameraDiscovery.defaultDevice()?.id
     }
 
     var isRecording: Bool { captureState == .recording }
+
+    var selectedCameraDisplayName: String {
+        availableCameras.first(where: { $0.id == selectedCameraID })?.displayName
+            ?? "No camera"
+    }
+
+    /// Live camera session for the on-screen facecam bubble while recording.
+    var liveCameraSession: MacCameraCaptureSession? {
+        guard isRecording || isCameraLive else { return nil }
+        return captureCoordinator.liveCameraSession
+    }
+
+    /// Normalized camera frame for the current layout (used by the live bubble).
+    var liveCameraLayoutFrame: NormalizedRect {
+        if let cameraBubbleFrameOverride { return cameraBubbleFrameOverride }
+        let frames = CaptureLayout.frames(for: captureLayout)
+        return frames.camera?.frame
+            ?? NormalizedRect(x: 0.74, y: 0.70, width: 0.22, height: 0.26)
+    }
+
+    var liveCameraIsCircle: Bool {
+        captureLayout == .screenWithCameraBubble
+            || (CaptureLayout.frames(for: captureLayout).camera?.isCircular == true)
+    }
+
+    func resetCameraBubbleOverride() {
+        cameraBubbleFrameOverride = nil
+    }
+
+    /// Drag the live bubble; keeps current size, moves center.
+    func dragCameraBubble(toNormalizedCenter center: NormalizedPoint) {
+        let prototype = CaptureLayout.frames(for: captureLayout).camera?.frame
+            ?? NormalizedRect(x: 0.74, y: 0.70, width: 0.22, height: 0.26)
+        cameraBubbleFrameOverride = CaptureLayout.cameraFrame(
+            from: cameraBubbleFrameOverride ?? prototype,
+            centeredAt: center
+        )
+    }
+
+    /// Re-apply layout to an existing project's screen/camera clips (undoable).
+    func applyCaptureLayout(
+        _ layout: CaptureLayoutID,
+        to projectID: ProjectID,
+        cameraFrameOverride: NormalizedRect? = nil
+    ) async throws -> ProjectWorkspace {
+        captureLayout = layout
+        if let cameraFrameOverride {
+            cameraBubbleFrameOverride = cameraFrameOverride
+        } else if layout != .screenWithCameraBubble {
+            cameraBubbleFrameOverride = nil
+        }
+        let workspace = try await repository.applyCaptureLayout(
+            layout,
+            to: projectID,
+            cameraFrameOverride: cameraFrameOverride ?? cameraBubbleFrameOverride
+        )
+        projects = try await repository.list()
+        return workspace
+    }
 
     var localStoragePath: String { storageRoot.path }
 
@@ -188,13 +272,21 @@ final class MacAppModel: ObservableObject {
         captureInbox.filter(\.canImport)
     }
 
-    /// Completed captures bypass this list entirely and are saved immediately.
-    /// Only an interrupted, failed, or storage-constrained capture may need a
-    /// person to choose whether to preserve or delete its recovery material.
+    /// Captures that still need a person-initiated save (or a retry after auto-import
+    /// failed). Includes stuck `.completed` sessions left in the inbox.
     var recoveryCaptures: [CaptureInboxItem] {
         captureInbox.filter {
-            $0.canImport && [.recovered, .storageConstrained, .failed].contains($0.status)
+            $0.canImport
+                && [.completed, .recovered, .storageConstrained, .failed].contains($0.status)
         }
+    }
+
+    func takePendingRecordingReveal(for projectID: ProjectID) -> MacRecordingReveal? {
+        guard let pendingRecordingReveal, pendingRecordingReveal.projectID == projectID else {
+            return nil
+        }
+        self.pendingRecordingReveal = nil
+        return pendingRecordingReveal
     }
 
     func enableCaptureShortcuts() {
@@ -241,8 +333,21 @@ final class MacAppModel: ObservableObject {
             if selectedProjectID == nil {
                 selectedProjectID = projects.first?.id
             }
+            // Completed sessions that never auto-imported (e.g. older dual-source
+            // clock bugs) stay in the inbox — retry them quietly so stop→view works.
+            if captureState == .ready || captureState == .finalized || captureState == .failed
+                || captureState == .recovered {
+                let stuckCompleted = captureInbox.filter {
+                    $0.status == .completed && $0.canImport
+                }
+                for item in stuckCompleted {
+                    await saveCapture(item, discardingStagingCopy: true)
+                }
+            }
             if captureState == .ready,
-               let recoverable = importableCaptures.first(where: { $0.status == .recovered }) {
+               let recoverable = importableCaptures.first(where: {
+                   [.recovered, .storageConstrained, .failed].contains($0.status)
+               }) {
                 captureState = .recovered
                 captureMessage = "An interrupted recording has \(recoverable.segmentCount) committed segment(s) ready to recover."
             }
@@ -353,17 +458,76 @@ final class MacAppModel: ObservableObject {
         )
         try ExportPreflight().validate(plan: plan, profile: profile)
         guard plan.captions.isEmpty,
-              plan.layers.allSatisfy({
-                  $0.transform == ClipTransform() && $0.gainDB == 0
-              })
+              plan.layers.allSatisfy({ $0.gainDB == 0 })
         else {
             throw MacTimelineExportError.unsupportedAdjustment
         }
 
+        let fileManager = FileManager.default
+        let partialURL = outputURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(UUID().uuidString).creatorstudio-export.mov"
+        )
+        defer { try? fileManager.removeItem(at: partialURL) }
+        let item = try await makeComposition(plan: plan, workspace: workspace, profile: profile)
+        guard let exporter = AVAssetExportSession(asset: item.asset, presetName: AVAssetExportPresetHighestQuality) else {
+            throw MacTimelineExportError.exporterUnavailable
+        }
+        exporter.videoComposition = item.videoComposition
+        exporter.shouldOptimizeForNetworkUse = true
+        try await MacCompositionExport.write(exporter, to: partialURL)
+        try Task.checkCancellation()
+        if fileManager.fileExists(atPath: outputURL.path) {
+            _ = try fileManager.replaceItemAt(outputURL, withItemAt: partialURL)
+        } else {
+            try fileManager.moveItem(at: partialURL, to: outputURL)
+        }
+    }
+
+    /// Preview uses the same composition and compositor as export, with one playback clock.
+    func layoutPreviewItem(workspace: ProjectWorkspace, sessionID: UUID?) async throws -> AVPlayerItem {
+        var preview = workspace
+        if let sessionID {
+            let ids = Set(workspace.project.assets.filter { $0.captureSessionID == sessionID }.map(\.id))
+            for index in preview.timeline.tracks.indices {
+                preview.timeline.tracks[index].clips.removeAll { !ids.contains($0.assetID) }
+            }
+            let clips = preview.timeline.tracks.flatMap(\.clips).filter(\.isEnabled)
+            let origin = clips.map(\.timelineStart).min() ?? .zero
+            let end = clips.map(\.timelineRange.end).max() ?? origin
+            for index in preview.timeline.tracks.indices {
+                for clipIndex in preview.timeline.tracks[index].clips.indices {
+                    preview.timeline.tracks[index].clips[clipIndex].timelineStart =
+                        preview.timeline.tracks[index].clips[clipIndex].timelineStart - origin
+                }
+            }
+            preview.timeline.focusEvents = preview.timeline.focusEvents.compactMap { event in
+                let start = max(event.timeRange.start, origin)
+                let stop = min(event.timeRange.end, end)
+                guard start < stop else { return nil }
+                var updated = event
+                updated.timeRange = StudioTimeRange(start: start - origin, duration: stop - start)
+                return updated
+            }
+            preview.timeline.captions = []
+        }
+        var profile = ExportProfile.landscapeTutorial
+        profile.canvas = workspace.project.defaultCanvas
+        let plan = try TimelineCompiler().compile(
+            timeline: preview.timeline, assets: preview.project.assets, canvas: profile.canvas
+        )
+        return try await makeComposition(plan: plan, workspace: preview, profile: profile)
+    }
+
+    private func makeComposition(
+        plan: RenderPlan,
+        workspace: ProjectWorkspace,
+        profile: ExportProfile
+    ) async throws -> AVPlayerItem {
         let composition = AVMutableComposition()
-        var videoLayerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
+        var layers: [MacCompositionLayer] = []
+        let usedAssetIDs = Set(plan.layers.map(\.asset.id))
         let assetURLs = try await withThrowingTaskGroup(of: (AssetID, URL).self) { group in
-            for asset in workspace.project.assets {
+            for asset in workspace.project.assets where usedAssetIDs.contains(asset.id) {
                 group.addTask { [repository] in
                     (asset.id, try await repository.assetURL(projectID: workspace.project.id, assetID: asset.id))
                 }
@@ -375,7 +539,12 @@ final class MacAppModel: ObservableObject {
             return result
         }
 
-        for layer in plan.layers {
+        let orderedLayers = plan.layers
+            .sorted { lhs, rhs in
+                Self.compositionZOrder(lhs.trackKind) > Self.compositionZOrder(rhs.trackKind)
+            }
+
+        for layer in orderedLayers {
             guard let sourceURL = assetURLs[layer.asset.id] else {
                 throw ProjectStoreError.invalidProject("The export plan references a missing source asset.")
             }
@@ -405,7 +574,11 @@ final class MacAppModel: ObservableObject {
                 }
 
                 let instruction = AVMutableVideoCompositionLayerInstruction(assetTrack: destinationTrack)
-                let baseTransform = try await Self.exportTransform(for: videoTrack, canvas: profile.canvas)
+                let baseTransform = try await Self.exportTransform(
+                    for: videoTrack,
+                    canvas: profile.canvas,
+                    frame: layer.transform.frame
+                )
                 instruction.setTransform(baseTransform, at: timelineRange.start)
                 try await Self.applyFocusZooms(
                     plan.focus,
@@ -419,7 +592,14 @@ final class MacAppModel: ObservableObject {
                 if timelineRange.end < composition.duration {
                     instruction.setOpacity(0, at: timelineRange.end)
                 }
-                videoLayerInstructions.append(instruction)
+                layers.append(MacCompositionLayer(
+                    trackID: destinationTrack.trackID,
+                    timeRange: timelineRange,
+                    frame: layer.transform.frame,
+                    cornerRadius: layer.transform.cornerRadius,
+                    opacity: layer.transform.opacity,
+                    transformInstruction: instruction
+                ))
             }
 
             if let audioTrack = try await sourceAsset.loadTracks(withMediaType: .audio).first {
@@ -439,34 +619,18 @@ final class MacAppModel: ObservableObject {
             }
         }
 
-        guard !videoLayerInstructions.isEmpty else { throw MacTimelineExportError.noVideo }
+        guard !layers.isEmpty else { throw MacTimelineExportError.noVideo }
         let videoComposition = AVMutableVideoComposition()
         videoComposition.renderSize = CGSize(width: profile.canvas.width, height: profile.canvas.height)
         videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(profile.framesPerSecond))
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
-        instruction.layerInstructions = videoLayerInstructions.reversed()
-        videoComposition.instructions = [instruction]
-
-        guard let exporter = AVAssetExportSession(
-            asset: composition,
-            presetName: AVAssetExportPresetHighestQuality
-        ) else {
-            throw MacTimelineExportError.exporterUnavailable
-        }
-        exporter.videoComposition = videoComposition
-        exporter.shouldOptimizeForNetworkUse = true
-
-        let fileManager = FileManager.default
-        let partialURL = outputURL.deletingLastPathComponent().appendingPathComponent(
-            ".\(UUID().uuidString).creatorstudio-export.mov"
-        )
-        defer { try? fileManager.removeItem(at: partialURL) }
-        try await exporter.export(to: partialURL, as: .mov)
-        if fileManager.fileExists(atPath: outputURL.path) {
-            try fileManager.removeItem(at: outputURL)
-        }
-        try fileManager.moveItem(at: partialURL, to: outputURL)
+        videoComposition.customVideoCompositorClass = MacTimelineCompositor.self
+        videoComposition.instructions = [MacCompositionInstruction(
+            timeRange: CMTimeRange(start: .zero, duration: composition.duration),
+            layers: layers
+        )]
+        let item = AVPlayerItem(asset: composition)
+        item.videoComposition = videoComposition
+        return item
     }
 
     func assetURL(projectID: ProjectID, assetID: AssetID) async throws -> URL {
@@ -557,9 +721,17 @@ final class MacAppModel: ObservableObject {
         }
     }
 
+    func refreshCameras() {
+        availableCameras = MacCameraDiscovery.devices()
+        if selectedCameraID == nil || !availableCameras.contains(where: { $0.id == selectedCameraID }) {
+            selectedCameraID = MacCameraDiscovery.defaultDevice()?.id
+        }
+    }
+
     func beginCapture() async {
         guard !captureIsBusy, !isRecording else { return }
         updatePreflight()
+        refreshCameras()
 
         if includeMicrophone {
             let authorized = await authorizeMicrophone()
@@ -570,6 +742,18 @@ final class MacAppModel: ObservableObject {
                 return
             }
         }
+        if includeCamera {
+            let authorized = await authorizeCamera()
+            if !authorized {
+                // Soft-fail: still allow screen recording without camera.
+                updatePreflight()
+                captureNotice =
+                    "Camera permission is not granted for this app build. Screen recording will continue without facecam. Toggle Camera off, or enable Camera for Creator Studio in Privacy settings (rebuilds may need a fresh grant)."
+                // Continue without camera rather than aborting the whole capture.
+            } else if selectedCameraID == nil, MacCameraDiscovery.defaultDevice() == nil {
+                captureNotice = "No camera is available. Recording screen only."
+            }
+        }
 
         let availableStorage = availableStorageBytes()
         guard availableStorage >= 1_000_000_000 else {
@@ -578,13 +762,39 @@ final class MacAppModel: ObservableObject {
             return
         }
 
-        captureCoordinator.presentPicker(options: MacCaptureOptions(
-            includeSystemAudio: includeSystemAudio,
-            includeMicrophone: includeMicrophone,
-            showCursor: showCursor,
-            highlightMouseClicks: highlightMouseClicks,
-            trackPointerMotion: trackMouseMovements || automaticFocusZoom
-        ))
+        captureCoordinator.presentPicker(options: captureOptions())
+    }
+
+    /// Camera-only recording for podcast / talking-head intents (no screen source).
+    func beginCameraOnlyCapture() async {
+        guard !captureIsBusy, !isRecording else { return }
+        updatePreflight()
+        refreshCameras()
+
+        let authorized = await authorizeCamera()
+        guard authorized else {
+            updatePreflight()
+            captureState = .failed
+            captureMessage = "Camera access is denied. Allow camera access in System Settings to record."
+            return
+        }
+        guard selectedCameraID != nil || MacCameraDiscovery.defaultDevice() != nil else {
+            captureState = .failed
+            captureMessage = "No camera is available. Connect a webcam or enable Continuity Camera from an iPhone."
+            return
+        }
+
+        let availableStorage = availableStorageBytes()
+        guard availableStorage >= 1_000_000_000 else {
+            captureState = .storageConstrained
+            captureMessage = "Free space is below the protected 1 GB recording reserve."
+            return
+        }
+
+        var options = captureOptions()
+        options.includeCamera = true
+        options.includeSystemAudio = false
+        await captureCoordinator.startCameraOnlyCapture(options: options)
     }
 
     func stopCapture() async {
@@ -592,6 +802,21 @@ final class MacAppModel: ObservableObject {
         captureState = .stopping
         captureMessage = "Stopping capture and committing every open media segment…"
         await captureCoordinator.stop()
+    }
+
+    private func captureOptions() -> MacCaptureOptions {
+        let cameraOK = includeCamera
+            && AVCaptureDevice.authorizationStatus(for: .video) == .authorized
+            && (selectedCameraID != nil || MacCameraDiscovery.defaultDevice() != nil)
+        return MacCaptureOptions(
+            includeSystemAudio: includeSystemAudio,
+            includeMicrophone: includeMicrophone,
+            includeCamera: cameraOK,
+            cameraDeviceID: selectedCameraID,
+            showCursor: showCursor,
+            highlightMouseClicks: highlightMouseClicks,
+            trackPointerMotion: trackMouseMovements || automaticFocusZoom
+        )
     }
 
     func markFocusAtCurrentCursor() {
@@ -649,7 +874,9 @@ final class MacAppModel: ObservableObject {
             let result = try await captureImporter.importSession(
                 id: item.sessionID,
                 into: destination.project.id,
-                recordingName: title
+                recordingName: title,
+                layout: captureLayout,
+                cameraFrameOverride: cameraBubbleFrameOverride
             )
             projects = try await repository.list()
             selectedProjectID = destination.project.id
@@ -681,6 +908,17 @@ final class MacAppModel: ObservableObject {
             captureMessage = result.wasRecovered
                 ? "Saved \(title) from recovered local media in Unlisted Recordings."
                 : "Saved \(title) in Unlisted Recordings."
+
+            // Prefer the first screen clip of this session for preview; fall back to camera.
+            let preferred = result.importedAssets.first(where: { $0.kind == .screenVideo })
+                ?? result.importedAssets.first(where: { $0.kind == .cameraVideo })
+                ?? result.importedAssets.first
+            pendingRecordingReveal = MacRecordingReveal(
+                projectID: destination.project.id,
+                captureSessionID: item.sessionID,
+                preferredAssetID: preferred?.id
+            )
+            projectContentEpoch &+= 1
         } catch {
             if let createdUnlistedProjectID {
                 try? await repository.delete(id: createdUnlistedProjectID)
@@ -695,9 +933,19 @@ final class MacAppModel: ObservableObject {
         var requestedSources: Set<CaptureSource> = [.screen]
         if includeSystemAudio { requestedSources.insert(.appAudio) }
         if includeMicrophone { requestedSources.insert(.microphone) }
+        if includeCamera { requestedSources.insert(.camera) }
         let microphoneDenied = AVCaptureDevice.authorizationStatus(for: .audio) == .denied
+        let cameraDenied = AVCaptureDevice.authorizationStatus(for: .video) == .denied
+        var capabilities = PlatformCapturePolicy().baselineCapabilities()
+        // Desktop always can request camera as a separate source when a device exists.
+        if !availableCameras.isEmpty || MacCameraDiscovery.defaultDevice() != nil {
+            capabilities.supportedSources.insert(.camera)
+        }
+        if cameraDenied {
+            capabilities.caveats.append("Camera permission is denied in System Settings.")
+        }
         preflight = CapturePreflightEvaluator().evaluate(CapturePreflightInput(
-            capabilities: PlatformCapturePolicy().baselineCapabilities(),
+            capabilities: capabilities,
             requestedSources: requestedSources,
             // The desktop recorder and importer share an app-owned directory;
             // no cross-process App Group handoff is needed on macOS.
@@ -719,46 +967,121 @@ final class MacAppModel: ObservableObject {
         }
     }
 
+    private func authorizeCamera() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            true
+        case .notDetermined:
+            // Only this path shows the system camera prompt (once).
+            await AVCaptureDevice.requestAccess(for: .video)
+        case .denied, .restricted:
+            // Already decided — do not call requestAccess again (it only bounces
+            // the user into Settings without granting for a new unsigned binary).
+            false
+        @unknown default:
+            false
+        }
+    }
+
+    func openCameraPrivacySettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Camera",
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), NSWorkspace.shared.open(url) { return }
+        }
+    }
+
     private func handleCaptureEvent(_ event: MacCaptureEvent) {
         switch event {
         case .selecting:
             liveCaptureSources = []
+            isCameraLive = false
+            hideFloatingCameraBubble()
             captureState = .preparing
             captureMessage = "Choose one window, application, or display in the system picker."
         case .starting:
             captureState = .preparing
             captureMessage = "Starting the local ScreenCaptureKit stream…"
+        case .cameraStarted:
+            isCameraLive = true
+            showFloatingCameraBubbleIfNeeded()
+            captureMessage = "Camera is live — facecam bubble is on your desktop."
         case .recording:
             captureState = .recording
+            if captureCoordinator.liveCameraSession != nil {
+                isCameraLive = true
+            }
+            showFloatingCameraBubbleIfNeeded()
             captureMessage = liveCaptureSources.contains(.screen)
-                ? "Video frames are arriving and being recorded locally."
-                : "Recording locally; waiting for the first video frame…"
+                ? (isCameraLive
+                    ? "Screen and camera are recording. Drag the facecam bubble on your desktop."
+                    : "Video frames are arriving and being recorded locally.")
+                : (isCameraLive
+                    ? "Camera is recording. Drag the facecam bubble on your desktop."
+                    : "Recording locally; waiting for the first video frame…")
         case let .sourceObserved(source):
             liveCaptureSources.insert(source)
+            if source == .camera {
+                isCameraLive = true
+                showFloatingCameraBubbleIfNeeded()
+            }
             let audioSources = liveCaptureSources.intersection([.appAudio, .microphone]).count
-            if liveCaptureSources.contains(.screen) {
+            let hasScreen = liveCaptureSources.contains(.screen)
+            let hasCamera = liveCaptureSources.contains(.camera)
+            if hasScreen, hasCamera {
+                captureMessage = audioSources > 0
+                    ? "Screen, camera, and audio are recording locally."
+                    : "Screen and camera frames are recording locally."
+            } else if hasScreen {
                 captureMessage = audioSources > 0
                     ? "Video and audio frames are arriving and being recorded locally."
                     : "Video frames are arriving and being recorded locally."
+            } else if hasCamera {
+                captureMessage = "Camera frames are arriving and being recorded locally."
             }
         case let .stopped(sessionID):
+            isCameraLive = false
+            hideFloatingCameraBubble()
             captureState = .importing
             captureMessage = "Recording stopped safely. Saving it in Unlisted Recordings…"
             Task { await automaticallySaveCompletedCapture(sessionID: sessionID) }
         case let .interrupted(message):
+            isCameraLive = false
+            hideFloatingCameraBubble()
             captureState = .recovered
             captureMessage = message
             Task { await refresh() }
         case .canceled:
+            isCameraLive = false
+            hideFloatingCameraBubble()
             captureState = .ready
             captureMessage = "Capture selection was canceled; nothing was recorded."
         case let .failed(message):
+            isCameraLive = false
+            hideFloatingCameraBubble()
             captureState = .failed
             captureMessage = message
             Task { await refresh() }
         case let .notice(message):
             captureNotice = message
         }
+    }
+
+    private func showFloatingCameraBubbleIfNeeded() {
+        guard let session = captureCoordinator.liveCameraSession else { return }
+        floatingCameraBubble.show(
+            session: session,
+            isCircle: liveCameraIsCircle,
+            diameter: 176
+        )
+        // Force SwiftUI observers (sidebar bubble) to re-read liveCameraSession.
+        objectWillChange.send()
+    }
+
+    private func hideFloatingCameraBubble() {
+        floatingCameraBubble.hide()
     }
 
     private func automaticallySaveCompletedCapture(sessionID: UUID) async {
@@ -982,9 +1305,11 @@ final class MacAppModel: ObservableObject {
         CMTime(value: time.microseconds, timescale: 1_000_000)
     }
 
+    /// Maps a source track into a normalized canvas frame (aspect-fill).
     private static func exportTransform(
         for track: AVAssetTrack,
-        canvas: CanvasSpec
+        canvas: CanvasSpec,
+        frame: NormalizedRect = .fullFrame
     ) async throws -> CGAffineTransform {
         let naturalSize = try await track.load(.naturalSize)
         let preferredTransform = try await track.load(.preferredTransform)
@@ -995,16 +1320,36 @@ final class MacAppModel: ObservableObject {
             throw MacTimelineExportError.invalidVideoDimensions
         }
 
-        let scale = min(
-            CGFloat(canvas.width) / orientedRect.width,
-            CGFloat(canvas.height) / orientedRect.height
+        // Editor NormalizedRect is top-left origin; AVVideoComposition is bottom-left.
+        let flippedY = 1 - frame.origin.y - frame.size.height
+        let target = CGRect(
+            x: frame.origin.x * CGFloat(canvas.width),
+            y: flippedY * CGFloat(canvas.height),
+            width: max(1, frame.size.width * CGFloat(canvas.width)),
+            height: max(1, frame.size.height * CGFloat(canvas.height))
         )
-        let centeredX = (CGFloat(canvas.width) - orientedRect.width * scale) / 2
-        let centeredY = (CGFloat(canvas.height) - orientedRect.height * scale) / 2
+        // Aspect-fill the source into the target rect (podcast bubble / split pane).
+        let scale = max(
+            target.width / orientedRect.width,
+            target.height / orientedRect.height
+        )
+        let drawnWidth = orientedRect.width * scale
+        let drawnHeight = orientedRect.height * scale
+        let originX = target.midX - drawnWidth / 2
+        let originY = target.midY - drawnHeight / 2
         return preferredTransform
             .concatenating(CGAffineTransform(translationX: -orientedRect.minX, y: -orientedRect.minY))
             .concatenating(CGAffineTransform(scaleX: scale, y: scale))
-            .concatenating(CGAffineTransform(translationX: centeredX, y: centeredY))
+            .concatenating(CGAffineTransform(translationX: originX, y: originY))
+    }
+
+    private static func compositionZOrder(_ kind: TrackKind) -> Int {
+        switch kind {
+        case .screen: 0
+        case .camera: 10
+        case .overlay, .annotation: 20
+        default: 5
+        }
     }
 
     /// Applies short, comfortable transform ramps around pointer-derived focus

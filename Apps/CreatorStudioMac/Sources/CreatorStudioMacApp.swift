@@ -1,3 +1,4 @@
+import StudioDomain
 import StudioExport
 import SwiftUI
 
@@ -36,11 +37,16 @@ struct CreatorStudioMacApp: App {
             }
 
             CommandMenu("Recording") {
-                Button(model.isRecording ? "Stop Screen Recording" : "Start Screen Recording…") {
+                Button(model.isRecording ? "Stop Recording" : "Start Screen Recording…") {
                     Task { await model.toggleCapture() }
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(model.captureIsBusy)
+
+                Button("Start Camera Recording…") {
+                    Task { await model.beginCameraOnlyCapture() }
+                }
+                .disabled(model.captureIsBusy || model.isRecording)
 
                 Button("Mark Focus at Current Cursor") {
                     model.markFocusAtCurrentCursor()
@@ -49,6 +55,25 @@ struct CreatorStudioMacApp: App {
                 .disabled(!model.isRecording)
 
                 Divider()
+
+                Toggle("Include Camera (Facecam)", isOn: $model.includeCamera)
+                    .disabled(model.isRecording || model.captureIsBusy)
+
+                Menu("Camera Layout") {
+                    ForEach(CaptureLayout.dualSourceLayouts) { layout in
+                        Button {
+                            model.captureLayout = layout
+                        } label: {
+                            HStack {
+                                Text(layout.displayName)
+                                if model.captureLayout == layout {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+                .disabled(model.isRecording || model.captureIsBusy || !model.includeCamera)
 
                 Toggle("Show Cursor in Recording", isOn: $model.showCursor)
                     .disabled(model.isRecording || model.captureIsBusy)

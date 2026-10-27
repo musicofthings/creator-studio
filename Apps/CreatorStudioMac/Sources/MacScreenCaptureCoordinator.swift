@@ -8,6 +8,9 @@ import StudioDomain
 struct MacCaptureOptions: Hashable, Sendable {
     var includeSystemAudio: Bool
     var includeMicrophone: Bool
+    var includeCamera: Bool
+    /// `AVCaptureDevice.uniqueID` for the selected facecam, when known.
+    var cameraDeviceID: String?
     var showCursor: Bool
     var highlightMouseClicks: Bool
     var trackPointerMotion: Bool
@@ -17,6 +20,8 @@ enum MacCaptureEvent: Sendable {
     case selecting
     case starting
     case recording(UUID)
+    /// Camera session is running and ready for the live facecam bubble.
+    case cameraStarted
     case sourceObserved(CaptureSource)
     case stopped(UUID)
     case interrupted(String)
@@ -42,16 +47,27 @@ final class MacScreenCaptureCoordinator: NSObject {
         }
     }
 
-    private lazy var streamDelegate = MacCaptureStreamDelegate { [weak self] detail in
+    private lazy var streamDelegate = MacCaptureStreamDelegate { [weak self] error in
         Task { @MainActor in
-            guard let self, !self.isStopping else { return }
-            await self.interrupt(detail: detail)
+            guard let self else { return }
+            // App-initiated stop owns finalization; ignore the delegate callback.
+            guard !self.isStopping else { return }
+            // ScreenCaptureKit reports intentional user stops through
+            // didStopWithError (SCStreamError.userStopped). That is a normal
+            // end of recording, not crash recovery.
+            if Self.isUserInitiatedStop(error) {
+                await self.finalizeActiveCapture()
+                return
+            }
+            await self.interrupt(detail: error.localizedDescription)
         }
     }
 
     private var options = MacCaptureOptions(
         includeSystemAudio: true,
         includeMicrophone: false,
+        includeCamera: false,
+        cameraDeviceID: nil,
         showCursor: true,
         highlightMouseClicks: true,
         trackPointerMotion: true
@@ -59,9 +75,15 @@ final class MacScreenCaptureCoordinator: NSObject {
     private var stream: SCStream?
     private var pipeline: CaptureWriterPipeline<MacCaptureSample>?
     private var pointerTracker: MacPointerTracker?
+    private let cameraSession = MacCameraCaptureSession()
     private var activeSessionID: UUID?
     private var isStopping = false
     private var observesPicker = false
+
+    /// Live facecam session for the on-screen bubble while recording.
+    var liveCameraSession: MacCameraCaptureSession? {
+        cameraSession.isActive ? cameraSession : nil
+    }
 
     init(
         inboxRootURL: URL,
@@ -73,7 +95,7 @@ final class MacScreenCaptureCoordinator: NSObject {
     }
 
     func presentPicker(options: MacCaptureOptions) {
-        guard stream == nil else { return }
+        guard stream == nil, !cameraSession.isActive else { return }
         self.options = options
 
         let picker = SCContentSharingPicker.shared
@@ -93,30 +115,36 @@ final class MacScreenCaptureCoordinator: NSObject {
         picker.present()
     }
 
-    func stop() async {
-        guard let stream, let pipeline else { return }
-        isStopping = true
+    /// Camera-only / podcast-style recording without a screen source (PRD Phase 1).
+    func startCameraOnlyCapture(options: MacCaptureOptions) async {
+        guard stream == nil, !cameraSession.isActive else { return }
+        self.options = options
+        onEvent(.starting)
         do {
-            try await stream.stopCapture()
-            sampleForwarder.clear()
-            // Hold the pipeline across the wait so finish callbacks can still
-            // commit segments after a host-side timeout.
-            let finished = await Task.detached {
-                pipeline.finishSynchronously(timeout: 20)
-            }.value
-            let sessionID = activeSessionID
-            clearActiveCapture()
-            if finished, let sessionID {
-                onEvent(.stopped(sessionID))
-            } else {
-                // Timed-out finalize is reclassified as interrupted on disk.
-                onEvent(.interrupted(
-                    "The stream stopped, but one or more media writers did not finish in time. Committed segments remain recoverable."
-                ))
-            }
+            try await beginSession(screenFilter: nil)
         } catch {
-            await interrupt(detail: error.localizedDescription)
+            sampleForwarder.clear()
+            clearActiveCapture()
+            onEvent(.failed("Camera recording could not start: \(error.localizedDescription)"))
         }
+    }
+
+    func stop() async {
+        guard pipeline != nil else { return }
+        isStopping = true
+        // stopCapture often completes by surfacing SCStreamError.userStopped to
+        // the delegate and/or as a thrown error. Both are expected for a normal
+        // Stop; always finalize as a completed session, never as recovery.
+        if let stream {
+            do {
+                try await stream.stopCapture()
+            } catch {
+                if !Self.isBenignStopError(error) {
+                    onEvent(.notice("Stream stop reported: \(error.localizedDescription)"))
+                }
+            }
+        }
+        await finalizeActiveCapture()
     }
 
     @discardableResult
@@ -127,41 +155,72 @@ final class MacScreenCaptureCoordinator: NSObject {
     }
 
     private func startCapture(with filter: SCContentFilter) async {
-        guard stream == nil else { return }
+        guard stream == nil, !cameraSession.isActive else { return }
         onEvent(.starting)
         SCContentSharingPicker.shared.isActive = false
+        do {
+            try await beginSession(screenFilter: filter)
+        } catch {
+            sampleForwarder.clear()
+            clearActiveCapture()
+            onEvent(.failed(
+                "Screen recording could not start: \(error.localizedDescription)"
+            ))
+        }
+    }
+
+    /// Shared session bootstrap for screen (+ optional camera) or camera-only.
+    private func beginSession(screenFilter: SCContentFilter?) async throws {
+        let wantsScreen = screenFilter != nil
+        let wantsCamera = options.includeCamera || !wantsScreen
+        guard wantsScreen || wantsCamera else {
+            throw MacCameraCaptureError.deviceUnavailable
+        }
+
+        var caveats = [
+            "Protected content may appear blank or omit audio.",
+            "Pointer clicks are rendered into the recording; editable pointer paths are a later adapter.",
+        ]
+        if wantsCamera {
+            caveats.append(MacCameraDevice.desktopAvailabilityNote)
+        }
 
         let capabilities = CaptureCapabilities(
-            supportedSources: supportedSources(for: options),
+            supportedSources: supportedSources(for: options, includeScreen: wantsScreen, includeCamera: wantsCamera),
             supportsBackgroundCapture: true,
             supportsPause: false,
-            caveats: [
-                "Protected content may appear blank or omit audio.",
-                "Pointer clicks are rendered into the recording; editable pointer paths are a later adapter.",
-            ]
+            caveats: caveats
         )
 
-        var persistence: CaptureSessionPersistence?
+        let createdPersistence: CaptureSessionPersistence
         do {
-            let createdPersistence = try CaptureSessionPersistence(
+            createdPersistence = try CaptureSessionPersistence(
                 inboxRootURL: inboxRootURL,
                 capabilities: capabilities
             )
-            persistence = createdPersistence
+        } catch {
+            throw error
+        }
+        do {
             let createdPipeline = CaptureWriterPipeline<MacCaptureSample>(
                 persistence: createdPersistence,
                 timing: { sample in
-                    let time = CMSampleBufferGetPresentationTimeStamp(sample.buffer)
-                    guard time.isValid, !time.isIndefinite else { return nil }
-                    return CMTimeGetSeconds(time)
+                    // Prefer host uptime so ScreenCaptureKit + AVCapture share one axis.
+                    guard sample.hostUptime.isFinite else { return nil }
+                    return sample.hostUptime
                 },
                 makeWriter: { source, index, directoryURL, firstSample, anchorSeconds in
+                    // Session placement uses host uptime (anchorSeconds + first sample host
+                    // uptime). Encoding still starts at each buffer's own media PTS inside
+                    // the writer — do not use media PTS as the session anchor or every
+                    // rotated segment gets startUs=0 and import fails on overlapping clips.
                     try MacCaptureSegmentWriter(
                         source: source,
                         index: index,
                         directoryURL: directoryURL,
                         firstSample: firstSample.buffer,
-                        anchorSeconds: anchorSeconds
+                        sessionAnchorSeconds: anchorSeconds,
+                        segmentHostStartSeconds: firstSample.hostUptime
                     )
                 },
                 capacityProvider: { url in
@@ -197,75 +256,147 @@ final class MacScreenCaptureCoordinator: NSObject {
                 }
             )
 
-            let configuration = try streamConfiguration(for: filter, options: options)
-            let tracker = options.trackPointerMotion
-                ? MacPointerTracker(
-                    sessionDirectoryURL: createdPersistence.directoryURL,
-                    contentRect: filter.contentRect
-                )
-                : nil
-            let createdStream = SCStream(
-                filter: filter,
-                configuration: configuration,
-                delegate: streamDelegate
-            )
+            let sourceObserver: @Sendable (CaptureSource) -> Void = { [weak self] source in
+                Task { @MainActor in
+                    self?.onEvent(.sourceObserved(source))
+                }
+            }
 
-            sampleForwarder.install(
-                createdPipeline,
-                sourceObserver: { [weak self] source in
-                    Task { @MainActor in
-                        self?.onEvent(.sourceObserved(source))
+            if let filter = screenFilter {
+                let configuration = try streamConfiguration(for: filter, options: options)
+                let tracker = options.trackPointerMotion
+                    ? MacPointerTracker(
+                        sessionDirectoryURL: createdPersistence.directoryURL,
+                        contentRect: filter.contentRect
+                    )
+                    : nil
+                let createdStream = SCStream(
+                    filter: filter,
+                    configuration: configuration,
+                    delegate: streamDelegate
+                )
+
+                sampleForwarder.install(
+                    createdPipeline,
+                    sourceObserver: sourceObserver,
+                    firstScreenSample: { [weak tracker] in
+                        tracker?.noteMediaClockOrigin()
                     }
-                },
-                firstScreenSample: { [weak tracker] in
-                    tracker?.noteMediaClockOrigin()
+                )
+                try createdStream.addStreamOutput(
+                    sampleForwarder,
+                    type: .screen,
+                    sampleHandlerQueue: sampleQueue
+                )
+                if options.includeSystemAudio {
+                    try createdStream.addStreamOutput(
+                        sampleForwarder,
+                        type: .audio,
+                        sampleHandlerQueue: sampleQueue
+                    )
                 }
-            )
-            try createdStream.addStreamOutput(
-                sampleForwarder,
-                type: .screen,
-                sampleHandlerQueue: sampleQueue
-            )
-            if options.includeSystemAudio {
-                try createdStream.addStreamOutput(
-                    sampleForwarder,
-                    type: .audio,
-                    sampleHandlerQueue: sampleQueue
-                )
-            }
-            if options.includeMicrophone {
-                try createdStream.addStreamOutput(
-                    sampleForwarder,
-                    type: .microphone,
-                    sampleHandlerQueue: sampleQueue
-                )
-            }
+                if options.includeMicrophone {
+                    try createdStream.addStreamOutput(
+                        sampleForwarder,
+                        type: .microphone,
+                        sampleHandlerQueue: sampleQueue
+                    )
+                }
 
-            pipeline = createdPipeline
-            pointerTracker = tracker
-            activeSessionID = createdPersistence.manifest.sessionID
-            stream = createdStream
-            isStopping = false
-            if let tracker {
-                if !MacPointerTracker.isAccessibilityTrusted {
-                    _ = MacPointerTracker.requestAccessibilityTrust(prompt: true)
+                pipeline = createdPipeline
+                pointerTracker = tracker
+                activeSessionID = createdPersistence.manifest.sessionID
+                stream = createdStream
+                isStopping = false
+
+                // Start camera before the screen stream so the live bubble is ready
+                // as soon as recording UI appears.
+                if wantsCamera {
+                    do {
+                        try startCamera(pipeline: createdPipeline, sourceObserver: sourceObserver)
+                        onEvent(.cameraStarted)
+                    } catch {
+                        onEvent(.notice(
+                            "Camera could not start (\(error.localizedDescription)). Continuing with screen only. If Camera is already enabled in Settings, toggle it off/on for Creator Studio after a rebuild."
+                        ))
+                    }
                 }
-                if !tracker.start() {
+
+                if let tracker {
+                    // Never force the system Accessibility prompt during capture start —
+                    // that opens System Settings and steals focus from recording.
+                    if !MacPointerTracker.isAccessibilityTrusted {
+                        onEvent(.notice(
+                            "Pointer tracking needs Accessibility permission. Recording continues; enable Accessibility for click/focus metadata."
+                        ))
+                    } else if !tracker.start() {
+                        onEvent(.notice(
+                            "Pointer tracking could not install its monitor. Recording continues without click or focus metadata."
+                        ))
+                    }
+                }
+                try await createdStream.startCapture()
+                onEvent(.recording(createdPersistence.manifest.sessionID))
+            } else {
+                // Camera-only: optional microphone still uses ScreenCaptureKit is not available
+                // without a content filter, so mic for camera-only is left to a later AVAudioEngine pass.
+                pipeline = createdPipeline
+                activeSessionID = createdPersistence.manifest.sessionID
+                isStopping = false
+                try startCamera(pipeline: createdPipeline, sourceObserver: sourceObserver)
+                onEvent(.cameraStarted)
+                if options.includeMicrophone {
                     onEvent(.notice(
-                        "Pointer tracking needs Accessibility permission in System Settings. Recording continues without click or focus metadata."
+                        "Camera-only mode records the selected camera. Include microphone with a screen recording, or import a separate audio track for now."
                     ))
                 }
+                onEvent(.recording(createdPersistence.manifest.sessionID))
             }
-            try await createdStream.startCapture()
-            onEvent(.recording(createdPersistence.manifest.sessionID))
         } catch {
             sampleForwarder.clear()
             clearActiveCapture()
-            if let persistence, persistence.manifest.files.isEmpty {
-                try? FileManager.default.removeItem(at: persistence.directoryURL)
+            if createdPersistence.manifest.files.isEmpty {
+                try? FileManager.default.removeItem(at: createdPersistence.directoryURL)
             }
-            onEvent(.failed(
-                "Screen recording could not start: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    private func startCamera(
+        pipeline: CaptureWriterPipeline<MacCaptureSample>,
+        sourceObserver: @escaping @Sendable (CaptureSource) -> Void
+    ) throws {
+        guard let device = MacCameraDiscovery.device(id: options.cameraDeviceID) else {
+            throw MacCameraCaptureError.deviceUnavailable
+        }
+        try cameraSession.start(
+            device: device,
+            pipeline: pipeline,
+            sourceObserver: sourceObserver
+        )
+    }
+
+    /// Commits open segments as a normal finalized session and auto-imports.
+    private func finalizeActiveCapture() async {
+        guard let pipeline else {
+            clearActiveCapture()
+            return
+        }
+        isStopping = true
+        sampleForwarder.clear()
+        // Hold the pipeline across the wait so finish callbacks can still
+        // commit segments after a host-side timeout.
+        let finished = await Task.detached {
+            pipeline.finishSynchronously(timeout: 20)
+        }.value
+        let sessionID = activeSessionID
+        clearActiveCapture()
+        if finished, let sessionID {
+            onEvent(.stopped(sessionID))
+        } else {
+            // Timed-out finalize is reclassified as interrupted on disk.
+            onEvent(.interrupted(
+                "The stream stopped, but one or more media writers did not finish in time. Committed segments remain recoverable."
             ))
         }
     }
@@ -276,6 +407,7 @@ final class MacScreenCaptureCoordinator: NSObject {
             onEvent(.failed(detail))
             return
         }
+        isStopping = true
         sampleForwarder.clear()
         let preserved = await Task.detached {
             pipeline.interruptSynchronously(detail: detail, timeout: 20)
@@ -289,12 +421,39 @@ final class MacScreenCaptureCoordinator: NSObject {
     }
 
     private func clearActiveCapture() {
+        cameraSession.stop()
         pointerTracker?.stop()
         pointerTracker = nil
         stream = nil
         pipeline = nil
         activeSessionID = nil
         isStopping = false
+    }
+
+    /// Intentional end of capture (in-app Stop, menu bar stop, or picker end).
+    private static func isUserInitiatedStop(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == SCStreamErrorDomain,
+           nsError.code == SCStreamError.Code.userStopped.rawValue {
+            return true
+        }
+        // Be tolerant of localization/domain differences across OS versions.
+        let message = nsError.localizedDescription.lowercased()
+        return message.contains("user stopped") || message.contains("stopped by the user")
+    }
+
+    /// Errors that are expected while deliberately stopping a stream.
+    private static func isBenignStopError(_ error: Error) -> Bool {
+        if isUserInitiatedStop(error) { return true }
+        let nsError = error as NSError
+        guard nsError.domain == SCStreamErrorDomain else { return false }
+        switch nsError.code {
+        case SCStreamError.Code.attemptToStopStreamState.rawValue,
+             SCStreamError.Code.removingStream.rawValue:
+            return true
+        default:
+            return false
+        }
     }
 
     private func handlePickerEvent(_ event: MacContentPickerEvent) {
@@ -310,10 +469,16 @@ final class MacScreenCaptureCoordinator: NSObject {
         }
     }
 
-    private func supportedSources(for options: MacCaptureOptions) -> Set<CaptureSource> {
-        var sources: Set<CaptureSource> = [.screen]
-        if options.includeSystemAudio { sources.insert(.appAudio) }
-        if options.includeMicrophone { sources.insert(.microphone) }
+    private func supportedSources(
+        for options: MacCaptureOptions,
+        includeScreen: Bool,
+        includeCamera: Bool
+    ) -> Set<CaptureSource> {
+        var sources: Set<CaptureSource> = []
+        if includeScreen { sources.insert(.screen) }
+        if includeCamera { sources.insert(.camera) }
+        if options.includeSystemAudio, includeScreen { sources.insert(.appAudio) }
+        if options.includeMicrophone, includeScreen { sources.insert(.microphone) }
         return sources
     }
 
@@ -347,9 +512,12 @@ final class MacScreenCaptureCoordinator: NSObject {
 
 final class MacCaptureSample: @unchecked Sendable {
     let buffer: CMSampleBuffer
+    /// Monotonic host uptime used for cross-source journal timing (screen + camera).
+    let hostUptime: Double
 
-    init(_ buffer: CMSampleBuffer) {
+    init(_ buffer: CMSampleBuffer, hostUptime: Double = ProcessInfo.processInfo.systemUptime) {
         self.buffer = buffer
+        self.hostUptime = hostUptime
     }
 }
 
@@ -474,14 +642,14 @@ private final class MacContentPickerObserver: NSObject, SCContentSharingPickerOb
 }
 
 private final class MacCaptureStreamDelegate: NSObject, SCStreamDelegate, @unchecked Sendable {
-    private let didStop: @Sendable (String) -> Void
+    private let didStop: @Sendable (Error) -> Void
 
-    init(didStop: @escaping @Sendable (String) -> Void) {
+    init(didStop: @escaping @Sendable (Error) -> Void) {
         self.didStop = didStop
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        didStop(error.localizedDescription)
+        didStop(error)
     }
 }
 

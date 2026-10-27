@@ -339,6 +339,79 @@ import Testing
     #expect((try await fixture.repository.load(id: project.id)).assets.isEmpty)
 }
 
+@Test func repairsZeroStartMultiSegmentSessionsOnImport() async throws {
+    let fixture = try CaptureImportFixture()
+    defer { fixture.remove() }
+    let persistence = try fixture.persistence()
+
+    // Same bug as a host/media clock mix: every segment committed with startUs=0.
+    // Import must still place adjacent clips instead of failing on overlaps.
+    let segments: [(CaptureSource, String, StudioTime)] = [
+        (.screen, "screen-0000.mov", StudioTime(seconds: 10)),
+        (.camera, "camera-0000.mov", StudioTime(seconds: 10)),
+        (.appAudio, "app-audio-0000.m4a", StudioTime(seconds: 10)),
+        (.screen, "screen-0001.mov", StudioTime(seconds: 5)),
+        (.camera, "camera-0001.mov", StudioTime(seconds: 5)),
+        (.appAudio, "app-audio-0001.m4a", StudioTime(seconds: 5)),
+    ]
+    for (source, filename, duration) in segments {
+        let data = Data("\(filename)-payload".utf8)
+        try data.write(to: persistence.directoryURL.appendingPathComponent("segments/\(filename)"))
+        try persistence.commit(CaptureSegment(
+            source: source,
+            relativePath: "segments/\(filename)",
+            sha256: fixture.sha256(data),
+            byteCount: Int64(data.count),
+            start: .zero,
+            duration: duration
+        ))
+    }
+    try persistence.recordLifecycle(.finalized, state: .finalized)
+    let project = try await fixture.repository.create(title: "Zero-start dual capture", intent: .tutorial)
+
+    let result = try await fixture.importer.importSession(
+        id: persistence.manifest.sessionID,
+        into: project.id
+    )
+    #expect(result.importedAssets.count == 6)
+
+    let byKind = Dictionary(grouping: result.importedAssets, by: \.kind)
+    #expect(byKind[.screenVideo]?.map(\.captureStart) == [.zero, StudioTime(seconds: 10)])
+    #expect(byKind[.cameraVideo]?.map(\.captureStart) == [.zero, StudioTime(seconds: 10)])
+    #expect(byKind[.appAudio]?.map(\.captureStart) == [.zero, StudioTime(seconds: 10)])
+
+    let workspace = try await fixture.repository.loadWorkspace(id: project.id)
+    let screenClips = try #require(workspace.timeline.tracks.first { $0.kind == .screen }).clips
+        .sorted { $0.timelineStart < $1.timelineStart }
+    #expect(screenClips.count == 2)
+    #expect(screenClips[0].timelineStart == .zero)
+    #expect(screenClips[1].timelineStart == StudioTime(seconds: 10))
+    let cameraClips = try #require(workspace.timeline.tracks.first { $0.kind == .camera }).clips
+        .sorted { $0.timelineStart < $1.timelineStart }
+    #expect(cameraClips.count == 2)
+    #expect(cameraClips[0].timelineStart == .zero)
+    #expect(cameraClips[1].timelineStart == StudioTime(seconds: 10))
+}
+
+@Test func repairedCaptureStartsLeavesDistinctStartsUntouched() {
+    let first = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/a.mov",
+        originalFilename: "screen-0000.mov",
+        duration: StudioTime(seconds: 2),
+        captureStart: .zero
+    )
+    let second = SourceAsset(
+        kind: .screenVideo,
+        relativePath: "sources/b.mov",
+        originalFilename: "screen-0001.mov",
+        duration: StudioTime(seconds: 2),
+        captureStart: StudioTime(seconds: 2)
+    )
+    let repaired = CaptureInboxImporter.repairedCaptureStarts([first, second])
+    #expect(repaired.map(\.captureStart) == [.zero, StudioTime(seconds: 2)])
+}
+
 @Test func importsSoundSegmentsAndReportsTheUnsoundOne() async throws {
     let fixture = try CaptureImportFixture()
     defer { fixture.remove() }

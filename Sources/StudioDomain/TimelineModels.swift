@@ -15,15 +15,36 @@ public struct ClipTransform: Hashable, Codable, Sendable {
     public var frame: NormalizedRect
     public var rotationDegrees: Double
     public var opacity: Double
+    /// Corner radius as a fraction of the shorter frame side (0 = rectangle, 0.5 = circle).
+    public var cornerRadius: Double
 
     public init(
         frame: NormalizedRect = .fullFrame,
         rotationDegrees: Double = 0,
-        opacity: Double = 1
+        opacity: Double = 1,
+        cornerRadius: Double = 0
     ) {
         self.frame = frame
         self.rotationDegrees = rotationDegrees
         self.opacity = opacity
+        self.cornerRadius = min(max(cornerRadius, 0), 0.5)
+    }
+
+    public var isCircular: Bool { cornerRadius >= 0.45 }
+
+    private enum CodingKeys: String, CodingKey {
+        case frame, rotationDegrees, opacity, cornerRadius
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        frame = try container.decodeIfPresent(NormalizedRect.self, forKey: .frame) ?? .fullFrame
+        rotationDegrees = try container.decodeIfPresent(Double.self, forKey: .rotationDegrees) ?? 0
+        opacity = try container.decodeIfPresent(Double.self, forKey: .opacity) ?? 1
+        cornerRadius = min(
+            max(try container.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 0, 0),
+            0.5
+        )
     }
 }
 

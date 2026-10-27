@@ -1,7 +1,10 @@
-.PHONY: test demo format lint xcodeproj ios-build macos-build gateway-install gateway-check check
+.PHONY: test demo format lint xcodeproj ios-build macos-build gateway-install gateway-check compositor-test check
 
 test:
 	swift test
+
+compositor-test:
+	bash scripts/test_timeline_compositor.sh
 
 format:
 	swiftformat .
@@ -27,4 +30,4 @@ gateway-install:
 gateway-check:
 	npm --prefix services/ai-gateway run check
 
-check: lint test gateway-check ios-build macos-build
+check: lint test gateway-check compositor-test ios-build macos-build
