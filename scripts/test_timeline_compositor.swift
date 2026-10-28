@@ -59,6 +59,16 @@ struct TimelineCompositorRegression {
                    scale: 0.6, translation: CGPoint(x: -32, y: 72))
         try insert(screenTrack, sourceStart: 0, start: 0, duration: 4,
                    frame: .fullFrame, circle: false, scale: 1, translation: .zero)
+        let toneURL = root.appendingPathComponent("tone.caf")
+        try generateTone(toneURL)
+        let tone = AVURLAsset(url: toneURL)
+        let toneTrack = try await tone.loadTracks(withMediaType: .audio)[0]
+        var mixParameters: [AVAudioMixInputParameters] = []
+        for (start, gain) in [(0.0, -6.0), (2.0, 0.0)] {
+            let track = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+            try track.insertTimeRange(CMTimeRange(start: .zero, duration: time(2)), of: toneTrack, at: time(start))
+            mixParameters.append(try MacCompositionAudio.parameters(track: track, gainDB: gain, start: time(start)))
+        }
         let video = AVMutableVideoComposition()
         video.customVideoCompositorClass = MacTimelineCompositor.self
         video.renderSize = CGSize(width: 320, height: 240)
@@ -67,6 +77,9 @@ struct TimelineCompositorRegression {
         let output = root.appendingPathComponent("result.mov")
         let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality)!
         exporter.videoComposition = video
+        let mix = AVMutableAudioMix()
+        mix.inputParameters = mixParameters
+        exporter.audioMix = mix
         try await MacCompositionExport.write(exporter, to: output)
         let result = AVURLAsset(url: output)
         let duration = try await result.load(.duration)
@@ -115,6 +128,35 @@ struct TimelineCompositorRegression {
         try require(green(try await pixel(2.5, 40, 100)), "later rectangular clip uses its source trim and new location")
         try require(red(try await pixel(2.5, 110, 100)), "aspect-fill source is cropped to its pane")
         try require(red(try await pixel(3.5, 40, 100)), "camera hidden after its timeline end")
+        let audioReader = try AVAssetReader(asset: result)
+        let resultAudio = try await result.loadTracks(withMediaType: .audio)[0]
+        let audioSamples = AVAssetReaderTrackOutput(track: resultAudio, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsNonInterleaved: false,
+            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: 48000,
+        ])
+        audioReader.add(audioSamples)
+        try require(audioReader.startReading(), "exported audio can be decoded")
+        var energies = [Double](repeating: 0, count: 2)
+        var counts = [Int](repeating: 0, count: 2)
+        while let sample = audioSamples.copyNextSampleBuffer() {
+            let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+            let bucket = timestamp > 0.3 && timestamp < 1.7 ? 0 : (timestamp > 2.3 && timestamp < 3.7 ? 1 : -1)
+            guard bucket >= 0, let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+            let size = CMBlockBufferGetDataLength(block)
+            var bytes = [Float](repeating: 0, count: size / MemoryLayout<Float>.size)
+            let status = bytes.withUnsafeMutableBytes { buffer in
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: buffer.baseAddress!)
+            }
+            guard status == noErr else { throw NSError(domain: "Audio decode", code: Int(status)) }
+            for value in bytes { energies[bucket] += Double(value * value); counts[bucket] += 1 }
+        }
+        try require(audioReader.status == .completed && counts.allSatisfy { $0 > 0 }, "audio samples span both gain regions")
+        let ratio = sqrt((energies[0] / Double(counts[0])) / (energies[1] / Double(counts[1])))
+        try require(abs(ratio - 0.501) < 0.04, "exported audio applies -6 dB attenuation")
         let invalid = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality)!
         invalid.videoComposition = video
         var rejected = false
@@ -130,6 +172,18 @@ struct TimelineCompositorRegression {
         do { try await cancellation.value } catch is CancellationError { didCancel = true }
         try require(didCancel, "canceled export reports cancellation")
         print("All compositor regression checks passed.")
+    }
+
+    static func generateTone(_ url: URL) throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 192_000)!
+        buffer.frameLength = 192_000
+        let samples = buffer.floatChannelData![0]
+        for index in 0 ..< Int(buffer.frameLength) {
+            samples[index] = Float(0.2 * sin(2 * Double.pi * 440 * Double(index) / 48000))
+        }
+        try file.write(from: buffer)
     }
 
     static func generate(_ url: URL, camera: Bool) async throws {

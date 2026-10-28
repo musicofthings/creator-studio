@@ -452,6 +452,10 @@ import Testing
     #expect(result.skipped.count == 1)
     #expect(result.skipped.first?.relativePath == "segments/screen-0001.mov")
     #expect(try await fixture.repository.load(id: project.id).assets.count == 1)
+    let retained = await fixture.importer.discoverSession(id: persistence.manifest.sessionID)
+    #expect(retained?.status == .imported)
+    #expect(retained?.canImport == false)
+    #expect(FileManager.default.fileExists(atPath: badURL.path))
 }
 
 @Test func deletesTheProjectPackageItRolledBack() async throws {

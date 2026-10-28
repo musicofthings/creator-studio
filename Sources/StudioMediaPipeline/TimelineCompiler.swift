@@ -17,6 +17,7 @@ public enum TimelineCompilationError: Error, Equatable, Sendable {
     case invalidTimelineRange(ClipID)
     case invalidPlaybackRate(ClipID)
     case invalidTransform(ClipID)
+    case invalidGain(ClipID)
     case invalidFocus(FocusID)
     case invalidCaption(CaptionID)
 }
@@ -53,10 +54,13 @@ public struct TimelineCompiler: TimelineCompiling {
                 guard clip.playbackRate.isFinite, clip.playbackRate > 0 else {
                     throw TimelineCompilationError.invalidPlaybackRate(clip.id)
                 }
-                guard clip.sourceRange.isValid, clip.sourceRange.end <= asset.duration else {
+                guard AudioGain.linearVolume(for: clip.gainDB) != nil else {
+                    throw TimelineCompilationError.invalidGain(clip.id)
+                }
+                guard Self.hasValidBounds(clip.sourceRange), clip.sourceRange.end <= asset.duration else {
                     throw TimelineCompilationError.invalidSourceRange(clip.id)
                 }
-                guard clip.timelineStart >= .zero, clip.timelineDuration > .zero else {
+                guard Self.hasValidBounds(clip.timelineRange) else {
                     throw TimelineCompilationError.invalidTimelineRange(clip.id)
                 }
                 guard clip.transform.frame.isFinite,
@@ -84,13 +88,8 @@ public struct TimelineCompiler: TimelineCompiling {
             }
         }
 
-        let layerDuration = layers.map(\.timelineRange.end).max() ?? .zero
-        let captionDuration = timeline.captions.map(\.timeRange.end).max() ?? .zero
-        let focusDuration = timeline.focusEvents.map(\.timeRange.end).max() ?? .zero
-        let duration = max(layerDuration, captionDuration, focusDuration)
-
         let focusInstructions = try timeline.focusEvents.map { event in
-            guard event.timeRange.isValid,
+            guard Self.hasValidBounds(event.timeRange),
                   event.region.isFinite,
                   event.region.isPositive,
                   event.strength.isFinite,
@@ -107,12 +106,17 @@ public struct TimelineCompiler: TimelineCompiling {
         }
 
         for caption in timeline.captions {
-            guard caption.timeRange.isValid,
+            guard Self.hasValidBounds(caption.timeRange),
                   !caption.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else {
                 throw TimelineCompilationError.invalidCaption(caption.id)
             }
         }
+
+        let layerDuration = layers.map(\.timelineRange.end).max() ?? .zero
+        let captionDuration = timeline.captions.map(\.timeRange.end).max() ?? .zero
+        let focusDuration = timeline.focusEvents.map(\.timeRange.end).max() ?? .zero
+        let duration = max(layerDuration, captionDuration, focusDuration)
 
         return RenderPlan(
             projectID: timeline.projectID,
@@ -124,5 +128,9 @@ public struct TimelineCompiler: TimelineCompiling {
             focus: focusInstructions.sorted { $0.timeRange.start < $1.timeRange.start },
             captions: timeline.captions.sorted { $0.timeRange.start < $1.timeRange.start }
         )
+    }
+
+    private static func hasValidBounds(_ range: StudioTimeRange) -> Bool {
+        range.isValid && !range.start.microseconds.addingReportingOverflow(range.duration.microseconds).overflow
     }
 }

@@ -1,6 +1,6 @@
 # Implementation status
 
-**Updated:** 8 August 2026
+**Updated:** 28 October 2026
 **Milestone:** native macOS capture, workspace, editor, and first export slices implemented; runtime capture qualification pending
 
 ## macOS desktop foundation vertical slice
@@ -34,6 +34,10 @@ Every successful import appends a deterministic, non-destructive clip to the cor
 The interrupted-capture discovery cache now re-evaluates its time-derived stale status even when the manifest has stopped changing, so a session cached while active becomes recoverable after an extension crash. Project creation also removes incomplete packages if any root state document cannot be written, and extreme playback rates no longer trap timeline-duration calculation.
 
 ## Phase 1 timeline editing vertical slice
+
+The macOS Editor now previews the complete project through the same composition and audio mix as export. Its project-time scrubber supplies range start/end marks and split-at-playhead; numeric range fields and a selected-clip shortcut allow one undoable linked cut across all tracks. Clip selection seeks the project player instead of starting an independent source player. The Media tab retains source audition. Linked cuts preserve source ranges, playback rates, surviving gaps, and cross-source offsets, including later recording sessions, muted tracks, and disabled clips. Affected locks and overlapping focus/caption metadata reject the whole edit; later metadata shifts with the cut. The beta plan records the full linked-edit contract. Direct dragging, proportional timeline rows, filmstrips, and linked trim remain pending, and interactive seeking/edit refresh still needs a macOS smoke test.
+
+Audio track mute and per-clip attenuation from −60 to 0 dB are undoable and feed the shared preview/export mixer. Generated-media checks decode the exported audio to verify −6 dB attenuation. Retained imported recovery copies remain discoverable after relaunch, with Finder reveal and a deletion warning that distinguishes imported media from unimported segments.
 
 All interactive timeline mutations now pass through one deterministic domain reducer. The command set covers add, trim, split, reorder with ripple close, delete, and enable/disable. The clip inspector exposes half-second trim adjustments, an explicit split-point slider, earlier/later movement, disable, and delete actions. Selection is clip-specific even when several clips reference one asset, and preview seeks to the selected clip's immutable source range.
 

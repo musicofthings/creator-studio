@@ -275,13 +275,17 @@ final class MacAppModel: ObservableObject {
         captureInbox.filter(\.canImport)
     }
 
-    /// Captures that still need a person-initiated save (or a retry after auto-import
-    /// failed). Includes stuck `.completed` sessions left in the inbox.
+    /// Include retained imported sessions so users can inspect partial imports and
+    /// copies left behind when acknowledgement or cleanup did not finish.
     var recoveryCaptures: [CaptureInboxItem] {
         captureInbox.filter {
-            $0.canImport
-                && [.completed, .recovered, .storageConstrained, .failed].contains($0.status)
+            ($0.canImport && [.completed, .recovered, .storageConstrained, .failed].contains($0.status))
+                || ($0.status == .imported && $0.segmentCount > 0)
         }
+    }
+
+    func revealCaptureFiles(_ item: CaptureInboxItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([captureSessionDirectory(id: item.sessionID)])
     }
 
     func takePendingRecordingReveal(for projectID: ProjectID) -> MacRecordingReveal? {
@@ -460,9 +464,7 @@ final class MacAppModel: ObservableObject {
             canvas: profile.canvas
         )
         try ExportPreflight().validate(plan: plan, profile: profile)
-        guard plan.captions.isEmpty,
-              plan.layers.allSatisfy({ $0.gainDB == 0 })
-        else {
+        guard plan.captions.isEmpty else {
             throw MacTimelineExportError.unsupportedAdjustment
         }
 
@@ -476,6 +478,7 @@ final class MacAppModel: ObservableObject {
             throw MacTimelineExportError.exporterUnavailable
         }
         exporter.videoComposition = item.videoComposition
+        exporter.audioMix = item.audioMix
         exporter.shouldOptimizeForNetworkUse = true
         try await MacCompositionExport.write(exporter, to: partialURL)
         try Task.checkCancellation()
@@ -528,6 +531,7 @@ final class MacAppModel: ObservableObject {
     ) async throws -> AVPlayerItem {
         let composition = AVMutableComposition()
         var layers: [MacCompositionLayer] = []
+        var audioParameters: [AVAudioMixInputParameters] = []
         let usedAssetIDs = Set(plan.layers.map(\.asset.id))
         let assetURLs = try await withThrowingTaskGroup(of: (AssetID, URL).self) { group in
             for asset in workspace.project.assets where usedAssetIDs.contains(asset.id) {
@@ -619,6 +623,9 @@ final class MacAppModel: ObservableObject {
                         toDuration: timelineRange.duration
                     )
                 }
+                audioParameters.append(try MacCompositionAudio.parameters(
+                    track: destinationTrack, gainDB: layer.gainDB, start: timelineRange.start
+                ))
             }
         }
 
@@ -633,6 +640,11 @@ final class MacAppModel: ObservableObject {
         )]
         let item = AVPlayerItem(asset: composition)
         item.videoComposition = videoComposition
+        if !audioParameters.isEmpty {
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = audioParameters
+            item.audioMix = mix
+        }
         return item
     }
 
@@ -855,7 +867,7 @@ final class MacAppModel: ObservableObject {
             try await captureImporter.discardSession(id: item.sessionID)
             captureInbox = await captureImporter.discover()
             captureState = .ready
-            captureMessage = "Deleted the unimported recording and its recovery files."
+            captureMessage = "Deleted the recovery copy. Any imported project media remains available."
         } catch {
             errorMessage = error.localizedDescription
         }

@@ -2,6 +2,159 @@ import Foundation
 import StudioDomain
 import Testing
 
+@Test func linkedRangeCutPreservesRatesGapsAndLaterSessions() throws {
+    let assetID = AssetID()
+    let fast = TimelineClip(assetID: assetID, sourceRange: StudioTimeRange(start: StudioTime(seconds: 2), duration: StudioTime(seconds: 12)), timelineStart: StudioTime(seconds: 1), playbackRate: 2)
+    let slow = TimelineClip(assetID: assetID, sourceRange: StudioTimeRange(start: .zero, duration: StudioTime(seconds: 6)), timelineStart: StudioTime(seconds: 2), playbackRate: 0.5, gainDB: -6, isEnabled: false)
+    let later = TimelineClip(assetID: assetID, sourceRange: StudioTimeRange(start: StudioTime(seconds: 20), duration: StudioTime(seconds: 4)), timelineStart: StudioTime(seconds: 20))
+    let removed = TimelineClip(assetID: assetID, sourceRange: StudioTimeRange(start: .zero, duration: StudioTime(seconds: 1)), timelineStart: StudioTime(seconds: 4))
+    var timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    timeline.tracks = [
+        TimelineTrack(kind: .screen, order: 0, clips: [fast, later]),
+        TimelineTrack(kind: .microphone, order: 1, isMuted: true, clips: [slow]),
+        TimelineTrack(kind: .music, order: 2, clips: [removed]),
+    ]
+    timeline.captions = [CaptionCue(timeRange: StudioTimeRange(start: StudioTime(seconds: 2), duration: StudioTime(seconds: 1)), text: "Before")]
+    timeline.focusEvents = [FocusEvent(timeRange: StudioTimeRange(start: StudioTime(seconds: 7), duration: StudioTime(seconds: 1)), region: .fullFrame, strength: 0.5, source: .manual, confidence: 1)]
+    let tailID = ClipID()
+    let range = StudioTimeRange(start: StudioTime(seconds: 3), duration: StudioTime(seconds: 4))
+    let result = try TimelineEditor().performing(.removeLinked(range: range, trailingIDs: [slow.id: tailID]), on: timeline, history: TimelineEditHistory(timeline: timeline), assetDurations: [assetID: StudioTime(seconds: 30)])
+    let video = result.timeline.tracks[0].clips
+    #expect(video[0].sourceRange == StudioTimeRange(start: StudioTime(seconds: 2), duration: StudioTime(seconds: 4)))
+    #expect(video[0].timelineStart == fast.timelineStart)
+    #expect(video[1].timelineStart == StudioTime(seconds: 16))
+    #expect(video[1].sourceRange == later.sourceRange)
+    let audio = result.timeline.tracks[1].clips
+    #expect(audio[0].sourceRange.duration == StudioTime(seconds: 0.5))
+    #expect(audio[1].id == tailID)
+    #expect(audio[1].sourceRange.start == StudioTime(seconds: 2.5))
+    #expect(audio[1].timelineStart == StudioTime(seconds: 3))
+    #expect(audio[1].timelineRange.end == StudioTime(seconds: 10))
+    #expect(audio.allSatisfy { $0.playbackRate == 0.5 && $0.gainDB == -6 && !$0.isEnabled })
+    #expect(result.timeline.tracks[1].isMuted)
+    #expect(result.timeline.tracks[2].clips.isEmpty)
+    #expect(result.timeline.captions == timeline.captions)
+    #expect(result.timeline.focusEvents[0].timeRange.start == StudioTime(seconds: 3))
+    // The exact command and source snapshots survive persistence for relaunch undo/redo.
+    let savedHistory = try JSONDecoder().decode(TimelineEditHistory.self, from: JSONEncoder().encode(result.history))
+    let undone = try TimelineEditor().undoing(result.timeline, history: savedHistory)
+    #expect(undone.timeline.tracks == timeline.tracks)
+    #expect(undone.timeline.focusEvents == timeline.focusEvents)
+    let redone = try TimelineEditor().redoing(undone.timeline, history: undone.history)
+    #expect(redone.timeline.tracks == result.timeline.tracks)
+}
+
+@Test func linkedRangeCutRejectsInvalidBoundsMetadataAndAffectedLocks() throws {
+    let clip = TimelineClip(assetID: AssetID(), sourceRange: StudioTimeRange(start: .zero, duration: StudioTime(seconds: 10)), timelineStart: .zero)
+    var timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID(), tracks: [TimelineTrack(kind: .screen, order: 0, clips: [clip])])
+    let cut = StudioTimeRange(start: StudioTime(seconds: 3), duration: StudioTime(seconds: 2))
+    let command = TimelineCommand.removeLinked(range: cut, trailingIDs: [clip.id: ClipID()])
+    for range in [
+        StudioTimeRange(start: StudioTime(seconds: -1), duration: StudioTime(seconds: 2)),
+        StudioTimeRange(start: .zero, duration: .zero),
+        StudioTimeRange(start: StudioTime(seconds: 9), duration: StudioTime(seconds: 2)),
+        StudioTimeRange(start: StudioTime(microseconds: Int64.max - 1), duration: StudioTime(microseconds: 2)),
+    ] {
+        #expect(throws: TimelineEditError.invalidTimeline) {
+            _ = try TimelineEditor().applying(.removeLinked(range: range, trailingIDs: [:]), to: timeline)
+        }
+    }
+    #expect(throws: TimelineEditError.invalidTimeline) {
+        _ = try TimelineEditor().applying(.removeLinked(range: cut, trailingIDs: [clip.id: clip.id]), to: timeline)
+    }
+    timeline.focusEvents = [FocusEvent(timeRange: cut, region: .fullFrame, strength: 0.5, source: .manual, confidence: 1)]
+    #expect(throws: TimelineEditError.linkedRemovalOverlapsMetadata) {
+        _ = try TimelineEditor().applying(command, to: timeline)
+    }
+    timeline.focusEvents = []
+    // Even a later locked track must reject a ripple, because its start would move.
+    var later = clip
+    later.id = ClipID()
+    later.timelineStart = StudioTime(seconds: 20)
+    timeline.tracks.append(TimelineTrack(kind: .microphone, order: 1, isLocked: true, clips: [later]))
+    #expect(throws: TimelineEditError.trackLocked(timeline.tracks[1].id)) {
+        _ = try TimelineEditor().applying(command, to: timeline)
+    }
+    // A lock wholly before the range does not block the cut.
+    later.timelineStart = .zero
+    later.sourceRange = StudioTimeRange(start: .zero, duration: StudioTime(seconds: 1))
+    timeline.tracks[1].clips = [later]
+    #expect(try TimelineEditor().applying(command, to: timeline).tracks[1] == timeline.tracks[1])
+}
+
+@Test func linkedEditsRejectOverflowingPersistedRangesWithoutTrapping() throws {
+    let range = StudioTimeRange(start: StudioTime(microseconds: Int64.max - 1), duration: StudioTime(microseconds: 2))
+    var timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    timeline.captions = [CaptionCue(timeRange: range, text: "Invalid")]
+    #expect(throws: TimelineEditError.invalidTimeline) {
+        _ = try TimelineEditor().applying(.splitLinked(time: .zero, trailingIDs: [:]), to: timeline)
+    }
+    timeline.captions = []
+    timeline.tracks = [TimelineTrack(kind: .screen, order: 0, clips: [TimelineClip(assetID: AssetID(), sourceRange: StudioTimeRange(start: .zero, duration: StudioTime(microseconds: 2)), timelineStart: range.start)])]
+    #expect(throws: TimelineEditError.invalidTimeline) {
+        _ = try TimelineEditor().applying(.splitLinked(time: .zero, trailingIDs: [:]), to: timeline)
+    }
+}
+
+@Test func linkedRemovalCutsAcrossTracksAndUndoRestoresSources() throws {
+    let empty = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    let video = SourceAsset(kind: .screenVideo, relativePath: "s.mov", duration: StudioTime(seconds: 10))
+    let audio = SourceAsset(kind: .microphoneAudio, relativePath: "a.m4a", duration: StudioTime(seconds: 8))
+    let durations = [video.id: video.duration, audio.id: audio.duration]
+    let v = try TimelineEditor().placingCapturedAsset(video, at: .zero, in: empty, assetDurations: durations)
+    let a = try TimelineEditor().placingCapturedAsset(audio, at: StudioTime(seconds: 1), in: v.timeline, assetDurations: durations)
+    let range = StudioTimeRange(start: StudioTime(seconds: 3), duration: StudioTime(seconds: 2))
+    let command = TimelineCommand.removeLinked(range: range, trailingIDs: [v.clip.id: ClipID(), a.clip.id: ClipID()])
+    #expect(try JSONDecoder().decode(TimelineCommand.self, from: JSONEncoder().encode(command)) == command)
+    var source = a.timeline
+    source.captions = [CaptionCue(timeRange: StudioTimeRange(start: StudioTime(seconds: 7), duration: StudioTime(seconds: 1)), text: "Later")]
+    let edit = try TimelineEditor().performing(command, on: source, history: TimelineEditHistory(timeline: source), assetDurations: durations)
+    #expect(edit.timeline.tracks[0].clips.map(\.timelineStart) == [.zero, StudioTime(seconds: 3)])
+    #expect(edit.timeline.tracks[1].clips.map(\.timelineStart) == [StudioTime(seconds: 1), StudioTime(seconds: 3)])
+    #expect(edit.timeline.tracks[1].clips[1].sourceRange.start == StudioTime(seconds: 4))
+    #expect(edit.timeline.captions[0].timeRange.start == StudioTime(seconds: 5))
+    let undo = try TimelineEditor().undoing(edit.timeline, history: edit.history)
+    #expect(undo.timeline.tracks == a.timeline.tracks)
+    var locked = a.timeline
+    locked.tracks[1].isLocked = true
+    #expect(throws: TimelineEditError.trackLocked(locked.tracks[1].id)) {
+        _ = try TimelineEditor().applying(command, to: locked, assetDurations: durations)
+    }
+    var withCaption = a.timeline
+    withCaption.captions = [CaptionCue(timeRange: range, text: "Hello")]
+    #expect(throws: TimelineEditError.linkedRemovalOverlapsMetadata) {
+        _ = try TimelineEditor().applying(command, to: withCaption, assetDurations: durations)
+    }
+}
+
+@Test func linkedSplitPreservesOffsetsAndSupportsUndoRedo() throws {
+    let empty = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    let screen = SourceAsset(kind: .screenVideo, relativePath: "s.mov", duration: StudioTime(seconds: 10))
+    let audio = SourceAsset(kind: .microphoneAudio, relativePath: "a.m4a", duration: StudioTime(seconds: 10))
+    let durations = [screen.id: screen.duration, audio.id: audio.duration]
+    let s = try TimelineEditor().placingCapturedAsset(screen, at: StudioTime(seconds: 2), in: empty, assetDurations: durations)
+    let a = try TimelineEditor().placingCapturedAsset(audio, at: .zero, in: s.timeline, assetDurations: durations)
+    let screenTail = ClipID()
+    let audioTail = ClipID()
+    let command = TimelineCommand.splitLinked(time: StudioTime(seconds: 5), trailingIDs: [s.clip.id: screenTail, a.clip.id: audioTail])
+    let decoded = try JSONDecoder().decode(TimelineCommand.self, from: JSONEncoder().encode(command))
+    #expect(decoded == command)
+    let edited = try TimelineEditor().performing(command, on: a.timeline, history: TimelineEditHistory(timeline: a.timeline), assetDurations: durations)
+    #expect(edited.timeline.tracks[0].clips[0].timelineStart == StudioTime(seconds: 2))
+    #expect(edited.timeline.tracks[0].clips[1].timelineStart == StudioTime(seconds: 5))
+    #expect(edited.timeline.tracks[1].clips[1].timelineStart == StudioTime(seconds: 5))
+    #expect(edited.timeline.tracks[1].clips[1].sourceRange.start == StudioTime(seconds: 5))
+    let undone = try TimelineEditor().undoing(edited.timeline, history: edited.history)
+    #expect(undone.timeline.tracks == a.timeline.tracks)
+    let redone = try TimelineEditor().redoing(undone.timeline, history: undone.history)
+    #expect(redone.timeline.tracks == edited.timeline.tracks)
+    var locked = a.timeline
+    locked.tracks[1].isLocked = true
+    #expect(throws: TimelineEditError.trackLocked(locked.tracks[1].id)) {
+        _ = try TimelineEditor().applying(command, to: locked, assetDurations: durations)
+    }
+}
+
 @Test func synchronizedTracksKeepOffsetsWhenSplittingAndRejectRippleEdits() throws {
     let empty = TimelineDocument(id: TimelineID(), projectID: ProjectID())
     let screen = SourceAsset(kind: .screenVideo, relativePath: "sources/s.mov", duration: StudioTime(seconds: 10))

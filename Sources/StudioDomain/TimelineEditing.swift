@@ -11,8 +11,10 @@ public enum TimelineEditError: Error, Equatable, Sendable {
     case invalidSourceRange(ClipID)
     case invalidSplit(ClipID)
     case invalidMoveIndex(Int)
+    case invalidGain(ClipID)
     case overlappingClips(ClipID, ClipID)
     case synchronizedTracksRequireLinkedEdits
+    case linkedRemovalOverlapsMetadata
     case historyUnavailable
     case historyMismatch
 }
@@ -40,10 +42,14 @@ extension TimelineEditError: LocalizedError {
             "Choose a split point inside the clip."
         case .invalidMoveIndex:
             "The clip cannot be moved to that position."
+        case .invalidGain:
+            "Audio gain must be between -60 and 0 dB."
         case .overlappingClips:
             "Clips on the same track cannot overlap. Place them adjacent or on separate tracks."
         case .synchronizedTracksRequireLinkedEdits:
-            "This edit would desynchronize other tracks. Linked track editing is not yet available."
+            "This edit would desynchronize other tracks. Use a linked time-range cut instead."
+        case .linkedRemovalOverlapsMetadata:
+            "Remove or adjust focus markers and captions that overlap this range before cutting it."
         case .historyUnavailable:
             "There is no timeline edit to restore."
         case .historyMismatch:
@@ -69,9 +75,15 @@ public enum TimelineCommand: Hashable, Codable, Sendable {
     )
     case trim(clipID: ClipID, sourceRange: StudioTimeRange)
     case split(clipID: ClipID, sourceTime: StudioTime, trailingClipID: ClipID)
+    /// Split every clip crossing one project time. IDs are supplied by the caller
+    /// so persisted commands remain deterministic when replayed.
+    case splitLinked(time: StudioTime, trailingIDs: [ClipID: ClipID])
+    case removeLinked(range: StudioTimeRange, trailingIDs: [ClipID: ClipID])
     case move(clipID: ClipID, toIndex: Int)
     case delete(clipID: ClipID)
     case setEnabled(clipID: ClipID, isEnabled: Bool)
+    case setTrackMuted(trackID: TrackID, isMuted: Bool)
+    case setClipGain(clipID: ClipID, gainDB: Double)
     case setClipTransform(clipID: ClipID, transform: ClipTransform)
     case addFocusEvents([FocusEvent])
 }
@@ -415,6 +427,117 @@ public struct TimelineEditor: Sendable {
             timeline.tracks[location.track].clips[location.clip] = leading
             timeline.tracks[location.track].clips.insert(trailing, at: location.clip + 1)
 
+        case let .splitLinked(time, trailingIDs):
+            let crossing = timeline.tracks.flatMap(\.clips).filter {
+                $0.timelineStart < time && time < $0.timelineRange.end
+            }
+            guard !crossing.isEmpty, Set(crossing.map(\.id)) == Set(trailingIDs.keys) else {
+                throw TimelineEditError.invalidTimeline
+            }
+            let existingIDs = Set(timeline.tracks.flatMap(\.clips).map(\.id))
+            let newIDs = Array(trailingIDs.values)
+            guard Set(newIDs).count == newIDs.count, existingIDs.isDisjoint(with: newIDs) else {
+                throw TimelineEditError.invalidTimeline
+            }
+            for trackIndex in timeline.tracks.indices {
+                guard timeline.tracks[trackIndex].clips.contains(where: { trailingIDs[$0.id] != nil }) else { continue }
+                try Self.requireUnlocked(timeline.tracks[trackIndex])
+                var clips: [TimelineClip] = []
+                for original in timeline.tracks[trackIndex].clips {
+                    guard let trailingID = trailingIDs[original.id] else {
+                        clips.append(original)
+                        continue
+                    }
+                    let fraction = Double((time - original.timelineStart).microseconds)
+                        / Double(original.timelineDuration.microseconds)
+                    let sourceOffset = Int64((Double(original.sourceRange.duration.microseconds) * fraction).rounded())
+                    guard sourceOffset > 0, sourceOffset < original.sourceRange.duration.microseconds else {
+                        throw TimelineEditError.invalidSplit(original.id)
+                    }
+                    var leading = original
+                    var trailing = original
+                    leading.sourceRange = StudioTimeRange(start: original.sourceRange.start, duration: StudioTime(microseconds: sourceOffset))
+                    trailing.id = trailingID
+                    trailing.sourceRange = StudioTimeRange(start: original.sourceRange.start + StudioTime(microseconds: sourceOffset), duration: StudioTime(microseconds: original.sourceRange.duration.microseconds - sourceOffset))
+                    trailing.timelineStart = leading.timelineStart + leading.timelineDuration
+                    clips.append(contentsOf: [leading, trailing])
+                }
+                timeline.tracks[trackIndex].clips = clips
+            }
+
+        case let .removeLinked(range, trailingIDs):
+            guard range.isValid else { throw TimelineEditError.invalidTimeline }
+            let end = try Self.safeEnd(of: range)
+            let allClips = timeline.tracks.flatMap(\.clips)
+            guard end <= (allClips.map(\.timelineRange.end).max() ?? .zero),
+                  allClips.contains(where: { $0.timelineRange.overlaps(range) }) else {
+                throw TimelineEditError.invalidTimeline
+            }
+            guard !timeline.focusEvents.contains(where: { $0.timeRange.overlaps(range) }),
+                  !timeline.captions.contains(where: { $0.timeRange.overlaps(range) })
+            else { throw TimelineEditError.linkedRemovalOverlapsMetadata }
+            let spanning = allClips.filter { $0.timelineStart < range.start && $0.timelineRange.end > end }
+            guard Set(spanning.map(\.id)) == Set(trailingIDs.keys),
+                  Set(trailingIDs.values).count == trailingIDs.count,
+                  Set(allClips.map(\.id)).isDisjoint(with: trailingIDs.values)
+            else { throw TimelineEditError.invalidTimeline }
+            for trackIndex in timeline.tracks.indices {
+                let track = timeline.tracks[trackIndex]
+                guard track.clips.contains(where: { $0.timelineRange.end > range.start }) else { continue }
+                try Self.requireUnlocked(track)
+                var result: [TimelineClip] = []
+                for clip in track.clips {
+                    let clipEnd = try Self.safeEnd(of: clip.timelineRange)
+                    if clipEnd <= range.start {
+                        result.append(clip)
+                        continue
+                    }
+                    if clip.timelineStart >= end {
+                        var shifted = clip
+                        shifted.timelineStart = clip.timelineStart - range.duration
+                        result.append(shifted)
+                        continue
+                    }
+                    let duration = clip.sourceRange.duration.microseconds
+                    let timelineDuration = clip.timelineDuration.microseconds
+                    func sourceOffset(_ point: StudioTime) -> Int64 {
+                        let fraction = Double((point - clip.timelineStart).microseconds) / Double(timelineDuration)
+                        let offset = (Double(duration) * fraction).rounded()
+                        if offset <= 0 { return 0 }
+                        if offset >= Double(duration) { return duration }
+                        return Int64(offset)
+                    }
+                    let leadingLength = clip.timelineStart < range.start ? sourceOffset(range.start) : 0
+                    let trailingStart = clipEnd > end ? sourceOffset(end) : duration
+                    guard leadingLength >= 0, trailingStart <= duration,
+                          leadingLength <= trailingStart,
+                          clip.timelineStart >= range.start || leadingLength > 0,
+                          clipEnd <= end || trailingStart < duration
+                    else { throw TimelineEditError.invalidTimeline }
+                    if leadingLength > 0 {
+                        var leading = clip
+                        leading.sourceRange = StudioTimeRange(start: clip.sourceRange.start, duration: StudioTime(microseconds: leadingLength))
+                        result.append(leading)
+                    }
+                    if trailingStart < duration {
+                        var trailing = clip
+                        if leadingLength > 0 { trailing.id = trailingIDs[clip.id]! }
+                        trailing.sourceRange = StudioTimeRange(start: clip.sourceRange.start + StudioTime(microseconds: trailingStart), duration: StudioTime(microseconds: duration - trailingStart))
+                        trailing.timelineStart = max(clip.timelineStart, end) - range.duration
+                        result.append(trailing)
+                    }
+                }
+                timeline.tracks[trackIndex].clips = result
+            }
+            for index in timeline.focusEvents.indices where timeline.focusEvents[index].timeRange.start >= end {
+                let previous = timeline.focusEvents[index].timeRange
+                timeline.focusEvents[index].timeRange = StudioTimeRange(start: previous.start - range.duration, duration: previous.duration)
+            }
+            for index in timeline.captions.indices where timeline.captions[index].timeRange.start >= end {
+                let previous = timeline.captions[index].timeRange
+                timeline.captions[index].timeRange = StudioTimeRange(start: previous.start - range.duration, duration: previous.duration)
+            }
+
         case let .move(clipID, toIndex):
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
@@ -440,6 +563,25 @@ public struct TimelineEditor: Sendable {
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
             timeline.tracks[location.track].clips[location.clip].isEnabled = isEnabled
+
+        case let .setTrackMuted(trackID, isMuted):
+            guard let index = timeline.tracks.firstIndex(where: { $0.id == trackID }) else {
+                throw TimelineEditError.trackNotFound(trackID)
+            }
+            try Self.requireUnlocked(timeline.tracks[index])
+            guard [.microphone, .appAudio, .music].contains(timeline.tracks[index].kind) else {
+                throw TimelineEditError.invalidTimeline
+            }
+            timeline.tracks[index].isMuted = isMuted
+
+        case let .setClipGain(clipID, gainDB):
+            let location = try Self.location(of: clipID, in: timeline)
+            let track = timeline.tracks[location.track]
+            try Self.requireUnlocked(track)
+            guard [.microphone, .appAudio, .music].contains(track.kind),
+                  AudioGain.linearVolume(for: gainDB) != nil
+            else { throw TimelineEditError.invalidGain(clipID) }
+            timeline.tracks[location.track].clips[location.clip].gainDB = gainDB
 
         case let .setClipTransform(clipID, transform):
             let location = try Self.location(of: clipID, in: timeline)
@@ -506,6 +648,10 @@ public struct TimelineEditor: Sendable {
         for event in timeline.focusEvents {
             try validate(focusEvent: event)
         }
+        for caption in timeline.captions {
+            guard caption.timeRange.isValid else { throw TimelineEditError.invalidTimeline }
+            _ = try safeEnd(of: caption.timeRange)
+        }
     }
 
     private static func validate(
@@ -521,6 +667,7 @@ public struct TimelineEditor: Sendable {
             throw TimelineEditError.invalidSourceRange(clip.id)
         }
         let sourceEnd = try safeEnd(of: clip.sourceRange)
+        _ = try safeEnd(of: clip.timelineRange)
         if let assetDuration = assetDurations[clip.assetID], sourceEnd > assetDuration {
             throw TimelineEditError.invalidSourceRange(clip.id)
         }
@@ -537,6 +684,7 @@ public struct TimelineEditor: Sendable {
         else {
             throw TimelineEditError.invalidTimeline
         }
+        _ = try safeEnd(of: focusEvent.timeRange)
     }
 
     private static func ripple(

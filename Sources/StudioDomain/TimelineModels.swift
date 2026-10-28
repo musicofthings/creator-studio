@@ -1,5 +1,14 @@
 import Foundation
 
+public enum AudioGain {
+    public static let range: ClosedRange<Double> = -60 ... 0
+
+    public static func linearVolume(for decibels: Double) -> Float? {
+        guard decibels.isFinite, range.contains(decibels) else { return nil }
+        return Float(pow(10, decibels / 20))
+    }
+}
+
 public enum TrackKind: String, Codable, Sendable {
     case screen
     case camera

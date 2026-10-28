@@ -622,7 +622,7 @@ private struct MacCaptureCard: View {
                             let names = [
                                 affected.contains(.appAudio) ? "system audio" : nil,
                                 affected.contains(.microphone) ? "microphone" : nil,
-                            ].compactMap { $0 }.joined(separator: " and ")
+                            ].compactMap(\.self).joined(separator: " and ")
                             Label("No recent \(names) samples. Check your source and permissions; silent apps may not send audio.", systemImage: "exclamationmark.triangle")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
@@ -642,24 +642,33 @@ private struct MacCaptureCard: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(recoveryTitle(for: item))
                                 .font(.caption.weight(.medium))
+                            Text(item.startedAt, style: .date)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                             Text("\(item.segmentCount) committed segment\(item.segmentCount == 1 ? "" : "s")")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Save to Unlisted") {
-                            Task { await model.importCapture(item) }
+                        if item.canImport {
+                            Button("Save to Unlisted") {
+                                Task { await model.importCapture(item) }
+                            }
+                            .controlSize(.small)
+                            .disabled(model.isWorking || model.isRecording)
+                            .creatorHelp("Copy this recovered recording into Unlisted Recordings")
+                        } else {
+                            Button("Show Files") { model.revealCaptureFiles(item) }
+                                .controlSize(.small)
+                                .creatorHelp("Show the retained original recovery files in Finder")
                         }
-                        .controlSize(.small)
-                        .disabled(model.isWorking || model.isRecording)
-                        .creatorHelp("Copy this recovered recording into Unlisted Recordings")
                         Button(role: .destructive) {
                             capturePendingDeletion = item
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
-                        .creatorHelp("Delete this unimported recording and its recovery files")
+                        .creatorHelp("Delete this recovery copy and its files")
                         .disabled(model.isWorking || model.isRecording)
                     }
                 }
@@ -674,20 +683,20 @@ private struct MacCaptureCard: View {
         .onChange(of: model.includeSystemAudio) { _, _ in model.updatePreflight() }
         .onChange(of: model.includeMicrophone) { _, _ in model.updatePreflight() }
         .confirmationDialog(
-            "Delete recovered recording?",
+            "Delete recovery copy?",
             isPresented: Binding(
                 get: { capturePendingDeletion != nil },
                 set: { if !$0 { capturePendingDeletion = nil } }
             ),
             titleVisibility: .visible
         ) {
-            Button("Delete Recording", role: .destructive) {
+            Button("Delete Recovery Copy", role: .destructive) {
                 guard let item = capturePendingDeletion else { return }
                 capturePendingDeletion = nil
                 Task { await model.discardCapture(item) }
             }
         } message: {
-            Text("This removes the unimported recording and all of its recovery files from this Mac.")
+            Text("This permanently removes the recovery files. Any media already imported into a project is kept; segments that were not imported will be lost.")
         }
     }
 
@@ -697,6 +706,7 @@ private struct MacCaptureCard: View {
         case .recovered: "Recovered recording"
         case .storageConstrained: "Storage-stopped recording"
         case .failed: "Failed recording"
+        case .imported: "Retained recovery copy"
         default: "Screen recording"
         }
     }
@@ -1065,6 +1075,10 @@ private struct MacProjectDetailView: View {
     @State private var splitSourceSeconds = 0.0
     @State private var workspaceTab: MacWorkspaceTab = .media
     @State private var layoutPlayer: AVPlayer?
+    @State private var editorPlayer: AVPlayer?
+    @State private var projectTimeSeconds = 0.0
+    @State private var rangeStartSeconds = 0.0
+    @State private var rangeEndSeconds = 0.0
     @State private var layoutScreenURL: URL?
     @State private var layoutCameraURL: URL?
     /// Capture session currently driving dual screen+camera preview.
@@ -1233,6 +1247,12 @@ private struct MacProjectDetailView: View {
         .onDisappear {
             player?.pause()
             layoutPlayer?.pause()
+            editorPlayer?.pause()
+        }
+        .onChange(of: workspaceTab) { _, tab in
+            player?.pause()
+            layoutPlayer?.pause()
+            editorPlayer?.pause()
         }
     }
 
@@ -1243,8 +1263,15 @@ private struct MacProjectDetailView: View {
                     GroupBox("Preview") {
                         ZStack {
                             Color.black
-                            if showsDualLayoutPreview(for: workspace),
-                               layoutScreenURL != nil || layoutCameraURL != nil {
+                            if workspaceTab == .editor {
+                                MacMasterTimelinePreview(
+                                    workspace: workspace,
+                                    model: model,
+                                    player: $editorPlayer,
+                                    projectTimeSeconds: $projectTimeSeconds
+                                )
+                            } else if showsDualLayoutPreview(for: workspace),
+                                      layoutScreenURL != nil || layoutCameraURL != nil {
                                 // Screen + facecam for the focused capture session only.
                                 MacLayoutPreviewView(
                                     workspace: workspace,
@@ -1266,7 +1293,7 @@ private struct MacProjectDetailView: View {
                         .frame(minHeight: 300)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                        if MacLayoutPreviewView.hasDualVideoLayout(
+                        if workspaceTab == .media, MacLayoutPreviewView.hasDualVideoLayout(
                             workspace,
                             captureSessionID: previewCaptureSessionID
                         ) {
@@ -1455,6 +1482,7 @@ private struct MacProjectDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
+                    linkedRangeEditor(workspace)
                     clipInspector(workspace)
                 }
 
@@ -1518,6 +1546,69 @@ private struct MacProjectDetailView: View {
         if isExporting { return "Rendering local 1080p movie…" }
         if isClearingCache { return "Clearing rebuildable cache…" }
         return "Saving timeline edit…"
+    }
+
+    private func selectedProjectRange(in workspace: ProjectWorkspace) -> StudioTimeRange? {
+        let duration = workspace.timeline.tracks.flatMap(\.clips).map(\.timelineRange.end).max() ?? .zero
+        guard rangeStartSeconds.isFinite, rangeEndSeconds.isFinite,
+              rangeStartSeconds >= 0, rangeEndSeconds <= duration.seconds,
+              rangeStartSeconds < rangeEndSeconds
+        else { return nil }
+        let start = StudioTime(seconds: rangeStartSeconds)
+        let end = StudioTime(seconds: rangeEndSeconds)
+        guard start < end else { return nil }
+        return StudioTimeRange(start: start, duration: end - start)
+    }
+
+    private func linkedRangeEditor(_ workspace: ProjectWorkspace) -> some View {
+        GroupBox("Project Time Range") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Start (seconds)")
+                    TextField("Start", value: $rangeStartSeconds, format: .number.precision(.fractionLength(3)))
+                        .frame(width: 100)
+                        .accessibilityLabel("Range start in project seconds")
+                    Button("Mark Start") { rangeStartSeconds = projectTimeSeconds }
+                    Text("End (seconds)")
+                    TextField("End", value: $rangeEndSeconds, format: .number.precision(.fractionLength(3)))
+                        .frame(width: 100)
+                        .accessibilityLabel("Range end in project seconds")
+                    Button("Mark End") { rangeEndSeconds = projectTimeSeconds }
+                }
+                .textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Split All Tracks at Playhead") {
+                        Task { await splitLinked(at: StudioTime(seconds: projectTimeSeconds), workspace: workspace) }
+                    }
+                    .disabled(!workspace.timeline.tracks.flatMap(\.clips).contains {
+                        $0.timelineStart.seconds < projectTimeSeconds && projectTimeSeconds < $0.timelineRange.end.seconds
+                    })
+                    Button("Use Selected Clip") {
+                        guard let clip = clipSelection(in: workspace)?.clip else { return }
+                        rangeStartSeconds = clip.timelineStart.seconds
+                        rangeEndSeconds = clip.timelineRange.end.seconds
+                    }
+                    .disabled(clipSelection(in: workspace) == nil)
+                    Button(role: .destructive) {
+                        guard let range = selectedProjectRange(in: workspace) else { return }
+                        Task { await removeLinkedRange(range, workspace: workspace) }
+                    } label: {
+                        Label("Remove Range from All Tracks", systemImage: "scissors")
+                    }
+                    .disabled(selectedProjectRange(in: workspace) == nil)
+                    Spacer()
+                    if let range = selectedProjectRange(in: workspace) {
+                        Text("\(timecode(range.start))–\(timecode(range.end)) • \(durationLabel(range.duration))")
+                            .font(.caption.monospacedDigit())
+                    }
+                }
+                Text("Use the project preview to mark a range. Cuts close time across every track and recording session, including muted and disabled clips. Overlapping captions or focus markers and affected locked tracks block the cut. Undo restores the edit.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.bordered)
+            .disabled(isApplyingEdit || isImporting)
+        }
     }
 
     @ViewBuilder
@@ -1597,10 +1688,54 @@ private struct MacProjectDetailView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .creatorHelp("Split this timeline reference at the chosen source time. The original recording stays intact.")
+                            Button {
+                                Task { await splitLinked(selection.clip, workspace: workspace) }
+                            } label: {
+                                Label("Split All Tracks at This Point", systemImage: "scissors")
+                            }
+                            .buttonStyle(.bordered)
+                            .creatorHelp("Split every clip crossing this project time without moving other clips, focus markers, or captions.")
                         }
                     }
 
                     Divider()
+
+                    if [.microphone, .appAudio, .music].contains(selection.track.kind) {
+                        Button {
+                            Task {
+                                await apply(
+                                    .setTrackMuted(trackID: selection.track.id, isMuted: !selection.track.isMuted),
+                                    status: selection.track.isMuted ? "Unmuted the audio track." : "Muted the audio track in preview and export."
+                                )
+                            }
+                        } label: {
+                            Label(selection.track.isMuted ? "Unmute Audio Track" : "Mute Audio Track", systemImage: selection.track.isMuted ? "speaker.wave.2" : "speaker.slash")
+                        }
+                        .buttonStyle(.bordered)
+                        .creatorHelp("Mute every clip on this audio track in preview and export. Undo restores the previous state.")
+                        HStack {
+                            Text("Clip gain: \(selection.clip.gainDB, specifier: "%.0f") dB")
+                                .font(.caption.monospacedDigit())
+                            Button("−3 dB") {
+                                Task { await apply(.setClipGain(clipID: selection.clip.id, gainDB: max(-60, selection.clip.gainDB - 3)), status: "Adjusted clip audio gain.") }
+                            }
+                            .disabled(selection.clip.gainDB <= -60)
+                            Button("+3 dB") {
+                                Task { await apply(.setClipGain(clipID: selection.clip.id, gainDB: min(0, selection.clip.gainDB + 3)), status: "Adjusted clip audio gain.") }
+                            }
+                            .disabled(selection.clip.gainDB >= 0)
+                        }
+                        .buttonStyle(.bordered)
+                        .creatorHelp("Adjust this clip's volume from −60 to 0 dB for preview and export. Use track mute for silence.")
+                    }
+
+                    Button(role: .destructive) {
+                        Task { await removeLinkedRange(selection.clip.timelineRange, workspace: workspace) }
+                    } label: {
+                        Label("Remove This Time from All Tracks", systemImage: "scissors")
+                    }
+                    .buttonStyle(.bordered)
+                    .creatorHelp("Remove the selected clip's time range from every track and close the gap. Undo restores it. Overlapping captions or focus markers must be adjusted first.")
 
                     HStack {
                         Button {
@@ -1735,6 +1870,33 @@ private struct MacProjectDetailView: View {
     }
 
     @MainActor
+    private func splitLinked(_ clip: TimelineClip, workspace: ProjectWorkspace) async {
+        let sourceOffset = StudioTime(seconds: splitSourceSeconds) - clip.sourceRange.start
+        let fraction = Double(sourceOffset.microseconds) / Double(clip.sourceRange.duration.microseconds)
+        let offset = StudioTime(microseconds: Int64((Double(clip.timelineDuration.microseconds) * fraction).rounded()))
+        let time = clip.timelineStart + offset
+        await splitLinked(at: time, workspace: workspace)
+    }
+
+    @MainActor
+    private func splitLinked(at time: StudioTime, workspace: ProjectWorkspace) async {
+        let crossing = workspace.timeline.tracks.flatMap(\.clips).filter {
+            $0.timelineStart < time && time < $0.timelineRange.end
+        }
+        let ids = Dictionary(crossing.map { ($0.id, ClipID()) }, uniquingKeysWith: { first, _ in first })
+        await apply(.splitLinked(time: time, trailingIDs: ids), status: "Split synchronized tracks without moving their clips.")
+    }
+
+    @MainActor
+    private func removeLinkedRange(_ range: StudioTimeRange, workspace: ProjectWorkspace) async {
+        let spanning = workspace.timeline.tracks.flatMap(\.clips).filter {
+            $0.timelineStart < range.start && $0.timelineRange.end > range.end
+        }
+        let ids = Dictionary(spanning.map { ($0.id, ClipID()) }, uniquingKeysWith: { first, _ in first })
+        await apply(.removeLinked(range: range, trailingIDs: ids), status: "Removed the selected time from all tracks. Undo restores it.")
+    }
+
+    @MainActor
     private func move(_ clip: TimelineClip, to index: Int) async {
         await apply(
             .move(clipID: clip.id, toIndex: index),
@@ -1768,6 +1930,15 @@ private struct MacProjectDetailView: View {
             let edited = try await model.applyTimelineCommand(command, to: projectID)
             workspace = edited
             reconcileSelection(in: edited)
+            if case let .removeLinked(range, _) = command {
+                if projectTimeSeconds >= range.end.seconds {
+                    projectTimeSeconds -= range.duration.seconds
+                } else if projectTimeSeconds >= range.start.seconds {
+                    projectTimeSeconds = range.start.seconds
+                }
+                rangeStartSeconds = 0
+                rangeEndSeconds = 0
+            }
             statusMessage = status
         } catch {
             model.errorMessage = error.localizedDescription
@@ -1967,7 +2138,9 @@ private struct MacProjectDetailView: View {
               let command = model.takeProjectCommand(for: projectID)
         else { return }
 
-        let playbackPlayer = showsDualLayoutPreview(for: workspace) ? layoutPlayer : player
+        let playbackPlayer = workspaceTab == .editor
+            ? editorPlayer
+            : (showsDualLayoutPreview(for: workspace) ? layoutPlayer : player)
         switch command {
         case .importMedia:
             isPresentingImporter = true
@@ -2150,6 +2323,18 @@ private struct MacProjectDetailView: View {
         clip: TimelineClip? = nil,
         preferDualIfAvailable: Bool = false
     ) async {
+        if workspaceTab == .editor {
+            selectedAssetID = asset.id
+            selectedClipID = clip?.id
+            if let clip {
+                projectTimeSeconds = clip.timelineStart.seconds
+                await editorPlayer?.seek(to: CMTime(seconds: projectTimeSeconds, preferredTimescale: 1_000_000), toleranceBefore: .zero, toleranceAfter: .zero)
+                if let range = splitRange(for: clip) {
+                    splitSourceSeconds = (range.lowerBound + range.upperBound) / 2
+                }
+            }
+            return
+        }
         do {
             if let workspace {
                 model.ensureIngest(for: workspace, assets: [asset])
@@ -2264,6 +2449,15 @@ private struct MacProjectDetailView: View {
                     .padding(4)
             }
         }
+        .overlay(alignment: .topTrailing) {
+            if let range = selectedProjectRange(in: workspace), range.overlaps(clip.timelineRange) {
+                Image(systemName: "scissors")
+                    .font(.caption2)
+                    .padding(4)
+                    .background(.regularMaterial, in: Circle())
+                    .accessibilityLabel("Overlaps selected project range")
+            }
+        }
         .opacity(clip.isEnabled ? 1 : 0.5)
     }
 
@@ -2302,6 +2496,94 @@ private struct MacProjectDetailView: View {
         case .image: "photo.fill"
         case .overlay: "square.on.square"
         }
+    }
+}
+
+/// Editor playback always uses project time and the same render graph as export.
+/// Media-tab source audition stays independent of this shared playback clock.
+private struct MacMasterTimelinePreview: View {
+    let workspace: ProjectWorkspace
+    let model: MacAppModel
+    @Binding var player: AVPlayer?
+    @Binding var projectTimeSeconds: Double
+    @State private var failure: String?
+    @State private var isPreparing = true
+    private let clock = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+
+    private var durationSeconds: Double {
+        let value = player?.currentItem?.duration.seconds ?? 0
+        return value.isFinite && value > 0 ? value : 0
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                if let player {
+                    MacNativePlayerView(player: player)
+                } else if let failure {
+                    ContentUnavailableView("Project preview unavailable", systemImage: "exclamationmark.triangle", description: Text(failure))
+                        .foregroundStyle(.white)
+                } else if isPreparing {
+                    ProgressView("Preparing project preview…")
+                }
+            }
+            .frame(minHeight: 240)
+
+            HStack {
+                Text("Project time")
+                    .font(.caption)
+                Slider(
+                    value: Binding(
+                        get: { min(max(projectTimeSeconds, 0), max(durationSeconds, 0.001)) },
+                        set: { seconds in
+                            projectTimeSeconds = seconds
+                            player?.pause()
+                            player?.seek(to: CMTime(seconds: seconds, preferredTimescale: 1_000_000), toleranceBefore: .zero, toleranceAfter: .zero)
+                        }
+                    ),
+                    in: 0 ... max(durationSeconds, 0.001)
+                )
+                .accessibilityLabel("Project playhead in seconds")
+                .disabled(player == nil || durationSeconds == 0)
+                Text(String(format: "%.3f s", projectTimeSeconds))
+                    .font(.caption.monospacedDigit())
+                    .frame(minWidth: 85, alignment: .trailing)
+            }
+            .padding(8)
+            .background(.regularMaterial)
+        }
+        .task(id: workspace.timeline) {
+            let position = projectTimeSeconds
+            let wasPlaying = (player?.rate ?? 0) > 0
+            player?.pause()
+            player = nil
+            isPreparing = true
+            failure = nil
+            defer { if !Task.isCancelled { isPreparing = false } }
+            do {
+                let item = try await model.layoutPreviewItem(workspace: workspace, sessionID: nil)
+                try Task.checkCancellation()
+                let updated = AVPlayer(playerItem: item)
+                let duration = try await item.asset.load(.duration).seconds
+                let target = duration.isFinite ? min(position, max(duration, 0)) : position
+                await updated.seek(to: CMTime(seconds: target, preferredTimescale: 1_000_000), toleranceBefore: .zero, toleranceAfter: .zero)
+                try Task.checkCancellation()
+                player = updated
+                projectTimeSeconds = target
+                if wasPlaying { updated.play() }
+            } catch is CancellationError {
+                // A newer timeline or another workspace tab owns playback now.
+            } catch {
+                guard !Task.isCancelled else { return }
+                failure = error.localizedDescription
+            }
+        }
+        .onReceive(clock) { _ in
+            guard let player else { return }
+            let seconds = player.currentTime().seconds
+            if seconds.isFinite { projectTimeSeconds = max(0, seconds) }
+        }
+        .onDisappear { player?.pause() }
     }
 }
 

@@ -4,6 +4,17 @@ import CoreMedia
 import Foundation
 import StudioDomain
 
+enum MacCompositionAudio {
+    static func parameters(track: AVCompositionTrack, gainDB: Double, start: CMTime) throws -> AVAudioMixInputParameters {
+        guard let volume = AudioGain.linearVolume(for: gainDB) else {
+            throw NSError(domain: "CreatorStudio.AudioGain", code: 1)
+        }
+        let parameters = AVMutableAudioMixInputParameters(track: track)
+        parameters.setVolume(volume, at: start)
+        return parameters
+    }
+}
+
 /// Immutable once the composition is handed to AVFoundation.
 struct MacCompositionLayer: @unchecked Sendable {
     let trackID: CMPersistentTrackID
