@@ -22,7 +22,8 @@ export class DeterministicSuggestionProvider implements SuggestionProvider {
       suggestions.push(this.title(first));
     }
     if (first && last && request.kinds.includes("chapter")) {
-      suggestions.push(this.chapter(first, last));
+      suggestions.push(this.chapter(first, request.transcript.reduce((latest, segment) =>
+        segment.endUs > latest.endUs ? segment : latest, last)));
     }
     if (first && last && request.kinds.includes("socialClip")) {
       suggestions.push(this.socialClip(request.transcript));

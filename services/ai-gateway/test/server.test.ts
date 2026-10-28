@@ -90,6 +90,20 @@ describe("AI gateway", () => {
     await app.close();
   });
 
+  it("rejects out-of-order segments and includes overlapping segment ends in chapters", async () => {
+    const app = buildServer({ authToken: null });
+    const reversed = await app.inject({ method: "POST", url: "/v1/suggestions", payload: requestBody({
+      transcript: [{ startUs: 10, endUs: 20, text: "later" }, { startUs: 0, endUs: 5, text: "earlier" }],
+    }) });
+    assert.equal(reversed.statusCode, 400);
+    const overlapping = await app.inject({ method: "POST", url: "/v1/suggestions", payload: requestBody({
+      transcript: [{ startUs: 0, endUs: 100, text: "long" }, { startUs: 10, endUs: 20, text: "short" }],
+    }) });
+    assert.equal(overlapping.statusCode, 200);
+    assert.equal(overlapping.json().suggestions.find((item: { kind: string }) => item.kind === "chapter").endUs, 100);
+    await app.close();
+  });
+
   it("requires the bearer token when one is configured", async () => {
     const app = buildServer({ authToken: "s3cret" });
 

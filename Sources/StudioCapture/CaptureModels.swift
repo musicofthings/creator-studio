@@ -9,6 +9,29 @@ public enum CaptureSource: String, Codable, CaseIterable, Sendable {
     case interactionEvents
 }
 
+/// Identifies requested audio sources for which no capture samples have arrived.
+/// Receiving samples does not establish that they contain audible sound.
+public enum CaptureAudioObservation {
+    public static func missingSources(
+        requested: Set<CaptureSource>, observed: Set<CaptureSource>, elapsed: TimeInterval,
+        gracePeriod: TimeInterval = 10
+    ) -> Set<CaptureSource> {
+        guard elapsed.isFinite, elapsed >= gracePeriod else { return [] }
+        return requested.intersection([.appAudio, .microphone]).subtracting(observed)
+    }
+
+    /// A source that has delivered samples may later stop delivering them.
+    public static func stalledSources(
+        requested: Set<CaptureSource>, lastObserved: [CaptureSource: Date], now: Date,
+        timeout: TimeInterval = 5
+    ) -> Set<CaptureSource> {
+        Set(requested.intersection([.appAudio, .microphone]).filter { source in
+            guard let last = lastObserved[source] else { return false }
+            return now.timeIntervalSince(last) >= timeout
+        })
+    }
+}
+
 public struct CaptureCapabilities: Hashable, Codable, Sendable {
     public var supportedSources: Set<CaptureSource>
     public var supportsBackgroundCapture: Bool

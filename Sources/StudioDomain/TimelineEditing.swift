@@ -12,6 +12,7 @@ public enum TimelineEditError: Error, Equatable, Sendable {
     case invalidSplit(ClipID)
     case invalidMoveIndex(Int)
     case overlappingClips(ClipID, ClipID)
+    case synchronizedTracksRequireLinkedEdits
     case historyUnavailable
     case historyMismatch
 }
@@ -41,6 +42,8 @@ extension TimelineEditError: LocalizedError {
             "The clip cannot be moved to that position."
         case .overlappingClips:
             "Clips on the same track cannot overlap. Place them adjacent or on separate tracks."
+        case .synchronizedTracksRequireLinkedEdits:
+            "This edit would desynchronize other tracks. Linked track editing is not yet available."
         case .historyUnavailable:
             "There is no timeline edit to restore."
         case .historyMismatch:
@@ -378,6 +381,7 @@ public struct TimelineEditor: Sendable {
         case let .trim(clipID, sourceRange):
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
+            try Self.requireSinglePopulatedTrack(timeline)
             timeline.tracks[location.track].clips[location.clip].sourceRange = sourceRange
             try Self.validate(
                 clip: timeline.tracks[location.track].clips[location.clip],
@@ -407,26 +411,30 @@ public struct TimelineEditor: Sendable {
                 start: sourceTime,
                 duration: sourceEnd - sourceTime
             )
+            trailing.timelineStart = leading.timelineStart + leading.timelineDuration
             timeline.tracks[location.track].clips[location.clip] = leading
             timeline.tracks[location.track].clips.insert(trailing, at: location.clip + 1)
-            try Self.ripple(trackAt: location.track, in: &timeline, assetDurations: assetDurations)
 
         case let .move(clipID, toIndex):
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
+            try Self.requireSinglePopulatedTrack(timeline)
             let clipCount = timeline.tracks[location.track].clips.count
             guard toIndex >= 0, toIndex < clipCount else {
                 throw TimelineEditError.invalidMoveIndex(toIndex)
             }
+            let origin = timeline.tracks[location.track].clips.first?.timelineStart ?? .zero
             let clip = timeline.tracks[location.track].clips.remove(at: location.clip)
             timeline.tracks[location.track].clips.insert(clip, at: toIndex)
-            try Self.ripple(trackAt: location.track, in: &timeline, assetDurations: assetDurations)
+            try Self.ripple(trackAt: location.track, in: &timeline, assetDurations: assetDurations, origin: origin)
 
         case let .delete(clipID):
             let location = try Self.location(of: clipID, in: timeline)
             try Self.requireUnlocked(timeline.tracks[location.track])
+            try Self.requireSinglePopulatedTrack(timeline)
+            let origin = timeline.tracks[location.track].clips.first?.timelineStart ?? .zero
             timeline.tracks[location.track].clips.remove(at: location.clip)
-            try Self.ripple(trackAt: location.track, in: &timeline, assetDurations: assetDurations)
+            try Self.ripple(trackAt: location.track, in: &timeline, assetDurations: assetDurations, origin: origin)
 
         case let .setEnabled(clipID, isEnabled):
             let location = try Self.location(of: clipID, in: timeline)
@@ -534,9 +542,10 @@ public struct TimelineEditor: Sendable {
     private static func ripple(
         trackAt trackIndex: Int,
         in timeline: inout TimelineDocument,
-        assetDurations: [AssetID: StudioTime]
+        assetDurations: [AssetID: StudioTime],
+        origin: StudioTime? = nil
     ) throws {
-        var start = StudioTime.zero
+        var start = origin ?? timeline.tracks[trackIndex].clips.first?.timelineStart ?? .zero
         for clipIndex in timeline.tracks[trackIndex].clips.indices {
             var clip = timeline.tracks[trackIndex].clips[clipIndex]
             try validate(clip: clip, assetDurations: assetDurations)
@@ -545,6 +554,12 @@ public struct TimelineEditor: Sendable {
             let (next, overflow) = start.microseconds.addingReportingOverflow(clip.timelineDuration.microseconds)
             guard !overflow else { throw TimelineEditError.invalidTimeline }
             start = StudioTime(microseconds: next)
+        }
+    }
+
+    private static func requireSinglePopulatedTrack(_ timeline: TimelineDocument) throws {
+        guard timeline.tracks.filter({ !$0.clips.isEmpty }).count <= 1 else {
+            throw TimelineEditError.synchronizedTracksRequireLinkedEdits
         }
     }
 

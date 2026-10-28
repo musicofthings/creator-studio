@@ -154,7 +154,9 @@ export function buildServer(options: ServerOptions): FastifyInstance {
     { schema: { body: suggestionRequestSchema } },
     async (request, reply) => {
       const body = request.body;
-      const ordering = body.transcript.find((segment) => segment.endUs <= segment.startUs);
+      const ordering = body.transcript.find((segment, index, segments) =>
+        segment.endUs <= segment.startUs || (index > 0 && segment.startUs < segments[index - 1]!.startUs),
+      );
       if (ordering) {
         return problem(
           reply,

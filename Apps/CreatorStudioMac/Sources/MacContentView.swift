@@ -571,6 +571,18 @@ private struct MacCaptureCard: View {
             }
 
             if model.isRecording {
+                if let startedAt = model.captureStartedAt {
+                    Label {
+                        Text(startedAt, style: .timer)
+                            .monospacedDigit()
+                    } icon: {
+                        Image(systemName: "record.circle.fill")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Recording duration")
+                    .creatorHelp("Elapsed time since capture started. Sources shown below indicate whether samples have arrived, not their audio level.")
+                }
                 HStack(spacing: 6) {
                     captureSignal(
                         "Video",
@@ -592,6 +604,31 @@ private struct MacCaptureCard: View {
                         systemImage: "mic.fill",
                         isActive: model.liveCaptureSources.contains(.microphone)
                     )
+                }
+                if let startedAt = model.captureStartedAt {
+                    TimelineView(.periodic(from: startedAt, by: 1)) { context in
+                        let missing = CaptureAudioObservation.missingSources(
+                            requested: model.requestedCaptureSources,
+                            observed: model.liveCaptureSources,
+                            elapsed: context.date.timeIntervalSince(startedAt)
+                        )
+                        let stalled = CaptureAudioObservation.stalledSources(
+                            requested: model.requestedCaptureSources,
+                            lastObserved: model.lastAudioSampleAt,
+                            now: context.date
+                        )
+                        if !missing.isEmpty || !stalled.isEmpty {
+                            let affected = missing.union(stalled)
+                            let names = [
+                                affected.contains(.appAudio) ? "system audio" : nil,
+                                affected.contains(.microphone) ? "microphone" : nil,
+                            ].compactMap { $0 }.joined(separator: " and ")
+                            Label("No recent \(names) samples. Check your source and permissions; silent apps may not send audio.", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                 }
             }
 

@@ -2,6 +2,22 @@ import Foundation
 import StudioDomain
 import Testing
 
+@Test func synchronizedTracksKeepOffsetsWhenSplittingAndRejectRippleEdits() throws {
+    let empty = TimelineDocument(id: TimelineID(), projectID: ProjectID())
+    let screen = SourceAsset(kind: .screenVideo, relativePath: "sources/s.mov", duration: StudioTime(seconds: 10))
+    let audio = SourceAsset(kind: .microphoneAudio, relativePath: "sources/a.m4a", duration: StudioTime(seconds: 10))
+    let durations = [screen.id: screen.duration, audio.id: audio.duration]
+    let s = try TimelineEditor().placingCapturedAsset(screen, at: StudioTime(seconds: 2), in: empty, assetDurations: durations)
+    let a = try TimelineEditor().placingCapturedAsset(audio, at: .zero, in: s.timeline, assetDurations: durations)
+    let split = try TimelineEditor().applying(.split(clipID: s.clip.id, sourceTime: StudioTime(seconds: 4), trailingClipID: ClipID()), to: a.timeline, assetDurations: durations)
+    #expect(split.tracks[0].clips[0].timelineStart == StudioTime(seconds: 2))
+    #expect(split.tracks[0].clips[1].timelineStart == StudioTime(seconds: 6))
+    #expect(split.tracks[1].clips[0].timelineStart == .zero)
+    #expect(throws: TimelineEditError.synchronizedTracksRequireLinkedEdits) {
+        _ = try TimelineEditor().applying(.delete(clipID: s.clip.id), to: split, assetDurations: durations)
+    }
+}
+
 @Test func appendingAssetsBuildsPersistentSequentialTracks() throws {
     let timeline = TimelineDocument(id: TimelineID(), projectID: ProjectID())
     let firstAsset = SourceAsset(

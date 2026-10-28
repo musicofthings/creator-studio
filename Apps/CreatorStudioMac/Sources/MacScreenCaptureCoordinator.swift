@@ -527,6 +527,7 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
     private var sourceObserver: (@Sendable (CaptureSource) -> Void)?
     private var firstScreenSample: (@Sendable () -> Void)?
     private var observedSources: Set<CaptureSource> = []
+    private var lastAudioObservation: [CaptureSource: TimeInterval] = [:]
     private var didNoteFirstScreenSample = false
 
     func install(
@@ -539,6 +540,7 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
             self.sourceObserver = sourceObserver
             self.firstScreenSample = firstScreenSample
             observedSources = []
+            lastAudioObservation = [:]
             didNoteFirstScreenSample = false
         }
     }
@@ -549,6 +551,7 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
             sourceObserver = nil
             firstScreenSample = nil
             observedSources = []
+            lastAudioObservation = [:]
             didNoteFirstScreenSample = false
         }
     }
@@ -577,7 +580,12 @@ private final class MacCaptureSampleForwarder: NSObject, SCStreamOutput, @unchec
             (@Sendable (CaptureSource) -> Void)?,
             (@Sendable () -> Void)?
         ) in
-            let observer = observedSources.insert(source).inserted ? sourceObserver : nil
+            let firstObservation = observedSources.insert(source).inserted
+            let now = ProcessInfo.processInfo.systemUptime
+            let isAudio = source == .appAudio || source == .microphone
+            let reportAudio = isAudio && now - (lastAudioObservation[source] ?? 0) >= 1
+            if isAudio && (firstObservation || reportAudio) { lastAudioObservation[source] = now }
+            let observer = firstObservation || reportAudio ? sourceObserver : nil
             let mediaOrigin: (@Sendable () -> Void)?
             if source == .screen, !didNoteFirstScreenSample {
                 didNoteFirstScreenSample = true

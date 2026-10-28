@@ -4,6 +4,22 @@ import Foundation
 import StudioDomain
 import Testing
 
+@Test func missingAudioWarningsRespectRequestedSourcesAndGracePeriod() {
+    let requested: Set<CaptureSource> = [.screen, .appAudio, .microphone]
+    #expect(CaptureAudioObservation.missingSources(requested: requested, observed: [], elapsed: 9) == [])
+    #expect(CaptureAudioObservation.missingSources(requested: requested, observed: [.microphone], elapsed: 10) == [.appAudio])
+    #expect(CaptureAudioObservation.missingSources(requested: requested, observed: [.microphone, .appAudio], elapsed: 20) == [])
+    #expect(CaptureAudioObservation.missingSources(requested: [.camera], observed: [], elapsed: 20) == [])
+}
+
+@Test func stalledAudioWarningsClearWhenSamplesResume() {
+    let now = Date(timeIntervalSince1970: 100)
+    let requested: Set<CaptureSource> = [.appAudio, .microphone]
+    #expect(CaptureAudioObservation.stalledSources(requested: requested, lastObserved: [.appAudio: now.addingTimeInterval(-6), .microphone: now], now: now) == [.appAudio])
+    #expect(CaptureAudioObservation.stalledSources(requested: requested, lastObserved: [.appAudio: now, .microphone: now], now: now) == [])
+    #expect(CaptureAudioObservation.stalledSources(requested: [.microphone], lastObserved: [.appAudio: now.addingTimeInterval(-10)], now: now) == [])
+}
+
 @Test func captureStateMachineCoversCaptureImportAndRecovery() async throws {
     let machine = CaptureStateMachine()
     try await machine.transition(to: .preparing)

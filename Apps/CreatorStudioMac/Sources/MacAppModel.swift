@@ -138,12 +138,15 @@ final class MacAppModel: ObservableObject {
     @Published var automaticFocusZoom = true
     @Published private(set) var availableCameras: [MacCameraDevice] = []
     @Published private(set) var captureState: CaptureState = .ready
+    @Published private(set) var captureStartedAt: Date?
     @Published private(set) var captureMessage = "Choose a window, application, or display when you are ready to record."
     /// Non-fatal capture notices (Accessibility, hotkey registration, etc.).
     @Published private(set) var captureNotice: String?
     @Published private(set) var captureInbox: [CaptureInboxItem] = []
     @Published private(set) var preflight: CapturePreflightReport?
     @Published private(set) var liveCaptureSources: Set<CaptureSource> = []
+    @Published private(set) var requestedCaptureSources: Set<CaptureSource> = []
+    @Published private(set) var lastAudioSampleAt: [CaptureSource: Date] = [:]
     @Published private(set) var ingestStatus: [AssetID: MacAssetIngestStatus] = [:]
 
     private let repository: FileProjectRepository
@@ -762,7 +765,12 @@ final class MacAppModel: ObservableObject {
             return
         }
 
-        captureCoordinator.presentPicker(options: captureOptions())
+        let options = captureOptions()
+        requestedCaptureSources = [.screen]
+        if options.includeSystemAudio { requestedCaptureSources.insert(.appAudio) }
+        if options.includeMicrophone { requestedCaptureSources.insert(.microphone) }
+        if options.includeCamera { requestedCaptureSources.insert(.camera) }
+        captureCoordinator.presentPicker(options: options)
     }
 
     /// Camera-only recording for podcast / talking-head intents (no screen source).
@@ -794,6 +802,8 @@ final class MacAppModel: ObservableObject {
         var options = captureOptions()
         options.includeCamera = true
         options.includeSystemAudio = false
+        // Camera-only capture does not yet provide microphone audio.
+        requestedCaptureSources = [.camera]
         await captureCoordinator.startCameraOnlyCapture(options: options)
     }
 
@@ -878,6 +888,9 @@ final class MacAppModel: ObservableObject {
                 layout: captureLayout,
                 cameraFrameOverride: cameraBubbleFrameOverride
             )
+            // The importer has committed the project and may have acknowledged the
+            // inbox. Later UI refresh failures must never roll back that project.
+            createdUnlistedProjectID = nil
             projects = try await repository.list()
             selectedProjectID = destination.project.id
             var workspace = try await repository.loadWorkspace(id: destination.project.id)
@@ -901,13 +914,19 @@ final class MacAppModel: ObservableObject {
             }
             ensureIngest(for: workspace, assets: result.importedAssets)
             captureState = .finalized
-            if discardingStagingCopy {
+            if discardingStagingCopy && result.skipped.isEmpty && result.inboxAcknowledged {
                 try? await captureImporter.discardSession(id: item.sessionID)
             }
             captureInbox = await captureImporter.discover()
             captureMessage = result.wasRecovered
                 ? "Saved \(title) from recovered local media in Unlisted Recordings."
                 : "Saved \(title) in Unlisted Recordings."
+            if !result.skipped.isEmpty {
+                let details = result.skipped.map { "\($0.relativePath): \($0.reason)" }.joined(separator: "\n")
+                errorMessage = "Some recording segments could not be imported. The original recovery files were kept at \(captureSessionDirectory(id: item.sessionID).path).\n\(details)"
+            } else if !result.inboxAcknowledged {
+                errorMessage = "The recording was saved, but its recovery copy could not be acknowledged and was kept."
+            }
 
             // Prefer the first screen clip of this session for preview; fall back to camera.
             let preferred = result.importedAssets.first(where: { $0.kind == .screenVideo })
@@ -996,12 +1015,16 @@ final class MacAppModel: ObservableObject {
     private func handleCaptureEvent(_ event: MacCaptureEvent) {
         switch event {
         case .selecting:
+            captureStartedAt = nil
             liveCaptureSources = []
             isCameraLive = false
             hideFloatingCameraBubble()
             captureState = .preparing
             captureMessage = "Choose one window, application, or display in the system picker."
         case .starting:
+            liveCaptureSources = []
+            lastAudioSampleAt = [:]
+            captureStartedAt = nil
             captureState = .preparing
             captureMessage = "Starting the local ScreenCaptureKit stream…"
         case .cameraStarted:
@@ -1009,6 +1032,7 @@ final class MacAppModel: ObservableObject {
             showFloatingCameraBubbleIfNeeded()
             captureMessage = "Camera is live — facecam bubble is on your desktop."
         case .recording:
+            captureStartedAt = Date()
             captureState = .recording
             if captureCoordinator.liveCameraSession != nil {
                 isCameraLive = true
@@ -1022,7 +1046,11 @@ final class MacAppModel: ObservableObject {
                     ? "Camera is recording. Drag the facecam bubble on your desktop."
                     : "Recording locally; waiting for the first video frame…")
         case let .sourceObserved(source):
-            liveCaptureSources.insert(source)
+            let isFirstObservation = liveCaptureSources.insert(source).inserted
+            if source == .appAudio || source == .microphone {
+                lastAudioSampleAt[source] = Date()
+            }
+            guard isFirstObservation else { return }
             if source == .camera {
                 isCameraLive = true
                 showFloatingCameraBubbleIfNeeded()
@@ -1042,23 +1070,27 @@ final class MacAppModel: ObservableObject {
                 captureMessage = "Camera frames are arriving and being recorded locally."
             }
         case let .stopped(sessionID):
+            captureStartedAt = nil
             isCameraLive = false
             hideFloatingCameraBubble()
             captureState = .importing
             captureMessage = "Recording stopped safely. Saving it in Unlisted Recordings…"
             Task { await automaticallySaveCompletedCapture(sessionID: sessionID) }
         case let .interrupted(message):
+            captureStartedAt = nil
             isCameraLive = false
             hideFloatingCameraBubble()
             captureState = .recovered
             captureMessage = message
             Task { await refresh() }
         case .canceled:
+            captureStartedAt = nil
             isCameraLive = false
             hideFloatingCameraBubble()
             captureState = .ready
             captureMessage = "Capture selection was canceled; nothing was recorded."
         case let .failed(message):
+            captureStartedAt = nil
             isCameraLive = false
             hideFloatingCameraBubble()
             captureState = .failed
